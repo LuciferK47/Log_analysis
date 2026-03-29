@@ -1,13 +1,14 @@
 """
 rule_engine.py — Temporal, YAML-Driven Diagnostic Rule Engine
 
-Evaluates diagnostic rules against the FULL feature time-series DataFrame,
-NOT global scalars. This ensures that AND conditions must be simultaneously
-true for at least N consecutive seconds to trigger, preventing false
-positives from events that happened minutes apart.
+Evaluates diagnostic rules against the FULL feature time-series DataFrame.
+Each rule specifies a `duration_seconds` hysteresis threshold — the combined
+condition must be simultaneously True for that many consecutive seconds
+before the rule triggers. This prevents false positives from brief noise
+spikes in real telemetry.
 
 Each triggered finding includes exact fault_start and fault_end timestamps
-for precise visualization.
+for precise visualization shading.
 """
 import logging
 import numpy as np
@@ -16,7 +17,7 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
-# Operator dispatch table
+# Operator dispatch table — returns boolean Series
 _OPERATORS = {
     '>':  lambda series, thresh: series > thresh,
     '>=': lambda series, thresh: series >= thresh,
@@ -25,27 +26,27 @@ _OPERATORS = {
     '==': lambda series, thresh: series == thresh,
 }
 
+# Default duration if not specified in the YAML rule
+_DEFAULT_DURATION_SECONDS = 1.0
+
 
 class RuleEngine:
     """
     Evaluates declarative diagnostic rules against feature time-series.
     Rules trigger only when all conditions are simultaneously true for
-    a minimum sustained duration.
+    the per-rule `duration_seconds` hysteresis window.
     """
 
-    def __init__(self, rules_path: str, sample_hz: int = 10,
-                 min_fault_seconds: float = 1.0):
+    def __init__(self, rules_path: str, sample_hz: int = 10):
         """
         Args:
             rules_path: Path to rules.yaml
-            sample_hz: Sampling rate of the input DataFrame
-            min_fault_seconds: Minimum consecutive seconds that all
-                               conditions must be true to trigger a rule.
+            sample_hz: Sampling rate of the input DataFrame (used to
+                       convert duration_seconds to sample counts).
         """
         with open(rules_path, 'r') as f:
             self.rules_config = yaml.safe_load(f)
         self.sample_hz = sample_hz
-        self.min_fault_samples = int(min_fault_seconds * sample_hz)
 
     def evaluate(self, features_ts: pd.DataFrame) -> list[dict]:
         """
@@ -53,11 +54,12 @@ class RuleEngine:
 
         Args:
             features_ts: DataFrame from abstraction layer with one column
-                         per abstract feature, indexed by time.
+                         per abstract feature, indexed by timedelta.
 
         Returns:
             List of triggered diagnostic findings, sorted by confidence.
-            Each finding includes fault_start and fault_end timestamps.
+            Each finding includes fault_start, fault_end, and
+            fault_duration_s.
         """
         findings = []
 
@@ -66,7 +68,6 @@ class RuleEngine:
             if result is not None:
                 findings.append(result)
 
-        # Sort by confidence descending
         findings.sort(key=lambda f: f['confidence'], reverse=True)
 
         if not findings:
@@ -84,14 +85,21 @@ class RuleEngine:
     def _eval_single_rule(self, rule_name: str, rule: dict,
                           features_ts: pd.DataFrame) -> dict | None:
         """
-        Evaluate one rule against the time-series. A rule triggers only
-        if its combined boolean mask has consecutive True values lasting
-        at least min_fault_samples.
+        Evaluate one rule with per-rule hysteresis.
+
+        The rule's `duration_seconds` field determines how long the
+        combined condition must be continuously True before triggering.
         """
         conditions = rule.get('conditions', [])
         logic = rule.get('logic', 'AND').upper()
 
-        # Build a boolean mask per condition (each is a full Series)
+        # Per-rule hysteresis from YAML
+        duration_s = float(
+            rule.get('duration_seconds', _DEFAULT_DURATION_SECONDS)
+        )
+        min_samples = max(1, int(duration_s * self.sample_hz))
+
+        # Build a boolean mask per condition
         condition_masks = []
         evidence = []
 
@@ -103,7 +111,6 @@ class RuleEngine:
             if feat_name not in features_ts.columns:
                 logger.debug("  %s: feature '%s' not in DataFrame",
                              rule_name, feat_name)
-                # Missing feature → condition is False everywhere
                 condition_masks.append(
                     pd.Series(False, index=features_ts.index)
                 )
@@ -111,7 +118,6 @@ class RuleEngine:
 
             series = features_ts[feat_name]
 
-            # Skip if all NaN
             if series.isna().all():
                 condition_masks.append(
                     pd.Series(False, index=features_ts.index)
@@ -127,12 +133,9 @@ class RuleEngine:
                 )
                 continue
 
-            mask = op_func(series, threshold)
-            # NaN comparisons → False
-            mask = mask.fillna(False)
+            mask = op_func(series, threshold).fillna(False)
             condition_masks.append(mask)
 
-            # Collect evidence from the peak value in the fault window
             evidence.append({
                 'feature': feat_name,
                 'operator': op_str,
@@ -142,23 +145,25 @@ class RuleEngine:
         if not condition_masks:
             return None
 
-        # Combine condition masks with AND or OR logic
+        # Combine masks
         if logic == 'AND':
             combined = condition_masks[0]
             for m in condition_masks[1:]:
                 combined = combined & m
-        else:  # OR
+        else:
             combined = condition_masks[0]
             for m in condition_masks[1:]:
                 combined = combined | m
 
-        # Find consecutive True runs of at least min_fault_samples
-        fault_start, fault_end = self._find_sustained_fault(combined)
+        # Find sustained fault with the per-rule duration
+        fault_start, fault_end = self._find_sustained_fault(
+            combined, min_samples
+        )
 
         if fault_start is None:
             return None
 
-        # Enrich evidence with actual peak values during the fault window
+        # Enrich evidence with peak values during the fault window
         for e in evidence:
             feat = e['feature']
             if feat in features_ts.columns:
@@ -167,19 +172,18 @@ class RuleEngine:
                     e['peak_value'] = round(float(fault_slice.abs().max()), 2)
                     e['mean_value'] = round(float(fault_slice.mean()), 2)
 
-        # Dynamic confidence: base + boost from how far values exceed
-        # thresholds within the fault window
+        # Dynamic confidence
         base_conf = float(rule.get('confidence', 0.5))
         ratios = []
         for e in evidence:
-            if e.get('peak_value') is not None and e['threshold'] != 0:
-                ratios.append(abs(e['peak_value'] / e['threshold']))
+            peak = e.get('peak_value')
+            if peak is not None and e['threshold'] != 0:
+                ratios.append(abs(peak / e['threshold']))
         if ratios:
             avg_ratio = sum(ratios) / len(ratios)
             boost = min(0.09, (avg_ratio - 1.0) * 0.03)
             base_conf = min(0.99, base_conf + max(0, boost))
 
-        # Compute fault duration
         fault_duration = (fault_end - fault_start).total_seconds()
 
         finding = {
@@ -193,43 +197,39 @@ class RuleEngine:
             'fault_start': fault_start,
             'fault_end': fault_end,
             'fault_duration_s': round(fault_duration, 2),
+            'duration_threshold_s': duration_s,
             'suggested_fix': rule.get('suggested_fix', '').strip(),
             'plot_signals': rule.get('plot_signals', []),
         }
 
         logger.info(
             "Rule '%s' TRIGGERED (confidence: %.2f, "
-            "window: %.1fs–%.1fs, duration: %.1fs)",
+            "window: %.1fs–%.1fs, duration: %.1fs, "
+            "required: %.1fs)",
             rule_name, base_conf,
             fault_start.total_seconds(), fault_end.total_seconds(),
-            fault_duration,
+            fault_duration, duration_s,
         )
         return finding
 
-    def _find_sustained_fault(self, mask: pd.Series):
+    def _find_sustained_fault(self, mask: pd.Series,
+                              min_samples: int):
         """
         Find the longest consecutive run of True values in the boolean
-        mask that lasts at least min_fault_samples. Returns the start
-        and end timestamps of that run, or (None, None).
+        mask that lasts at least min_samples. Returns (start, end)
+        timestamps or (None, None).
         """
         if not mask.any():
             return None, None
 
-        # Label consecutive groups
-        # When mask changes from False→True or True→False, the cumsum
-        # of ~mask increments, creating group IDs for True-runs.
+        # Label consecutive True-runs using cumsum of ~mask
         groups = (~mask).cumsum()
-
-        # Only keep True groups
         true_groups = groups[mask]
         if true_groups.empty:
             return None, None
 
-        # Count length of each True-run
         group_sizes = true_groups.groupby(true_groups).size()
-
-        # Filter to runs >= min_fault_samples
-        valid_groups = group_sizes[group_sizes >= self.min_fault_samples]
+        valid_groups = group_sizes[group_sizes >= min_samples]
 
         if valid_groups.empty:
             return None, None

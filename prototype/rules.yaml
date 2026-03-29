@@ -2,12 +2,14 @@
 # Diagnostic Rules — Declarative Failure Heuristics
 # ============================================================================
 # Each rule defines:
-#   conditions  : list of feature thresholds (all must be met for AND logic)
-#   logic       : AND | OR (how conditions combine)
-#   severity    : CRITICAL | WARNING | INFO
-#   confidence  : base confidence (0.0–1.0), boosted by how far above threshold
-#   suggested_fix : human-readable recommendation
-#   description : what this failure means physically
+#   conditions       : list of feature thresholds
+#   logic            : AND | OR (how conditions combine)
+#   duration_seconds : minimum consecutive seconds the combined condition must
+#                      be True to trigger (hysteresis to reject noise spikes)
+#   severity         : CRITICAL | WARNING | INFO
+#   confidence       : base confidence (0.0–1.0)
+#   suggested_fix    : human-readable recommendation
+#   plot_signals     : raw telemetry columns to plot when this rule triggers
 #
 # Community contributors: add your own rules below! Each rule is independent.
 # ============================================================================
@@ -30,6 +32,7 @@ rules:
         operator: ">"
         threshold: 300
     logic: "AND"
+    duration_seconds: 1.5
     severity: "CRITICAL"
     confidence: 0.90
     suggested_fix: >
@@ -56,6 +59,7 @@ rules:
         operator: ">"
         threshold: 0.8
     logic: "AND"
+    duration_seconds: 2.0
     severity: "CRITICAL"
     confidence: 0.85
     suggested_fix: >
@@ -79,6 +83,7 @@ rules:
         operator: ">"
         threshold: 0
     logic: "AND"
+    duration_seconds: 1.0
     severity: "WARNING"
     confidence: 0.88
     suggested_fix: >
@@ -99,6 +104,7 @@ rules:
         operator: "<"
         threshold: 14.0
     logic: "AND"
+    duration_seconds: 3.0
     severity: "WARNING"
     confidence: 0.80
     suggested_fix: >
@@ -119,6 +125,7 @@ rules:
         operator: "<"
         threshold: 2.0
     logic: "AND"
+    duration_seconds: 2.0
     severity: "WARNING"
     confidence: 0.70
     suggested_fix: >

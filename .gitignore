@@ -4,6 +4,18 @@ Gsoc_26.txt
 # Python
 __pycache__/
 *.pyc
+*.egg-info/
 
 # Local ArduPilot clone (managed via setup_sitl.sh)
 ardupilot/
+
+# Generated diagnostic outputs (never commit these)
+*.png
+*.jpg
+*.json
+!feature_registry.yaml
+!rules.yaml
+
+# IDE
+.vscode/
+.idea/
