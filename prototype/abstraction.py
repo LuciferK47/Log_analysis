@@ -1,15 +1,20 @@
 """
 abstraction.py — Version-Agnostic Feature Extraction Layer
 
-This is the core innovation of the proposal. It consumes feature_registry.yaml
-and applies fallback logic to compute features from whatever columns are
-actually present in the log, regardless of firmware version.
+Core innovation of the proposal. Consumes feature_registry.yaml and applies
+fallback logic to compute features from whatever columns are present,
+regardless of firmware version.
 
-Key improvement over v1: replaces unsafe eval() with a safe ${COL} expression
-parser that only supports arithmetic operations on DataFrame columns.
+Key design decisions:
+  - Returns the FULL time-series DataFrame (not crushed scalars) so the rule
+    engine can evaluate temporal co-occurrence of conditions.
+  - Uses Python's ast module for safe expression parsing instead of eval()
+    or fragile regex splitting.
 """
-import re
+import ast
 import logging
+import operator
+import re
 import numpy as np
 import pandas as pd
 import yaml
@@ -17,15 +22,7 @@ import yaml
 logger = logging.getLogger(__name__)
 
 # Regex to find ${COLUMN_NAME} references in fallback expressions
-_COL_REF = re.compile(r'\$\{([^}]+)\}')
-
-# Allowed numpy functions in expressions (whitelist for safety)
-_SAFE_FUNCS = {
-    'abs': np.abs,
-    'max': np.maximum,
-    'min': np.minimum,
-    'sqrt': np.sqrt,
-}
+_COL_REF_PATTERN = re.compile(r'\$\{([^}]+)\}')
 
 
 class FeatureExtractor:
@@ -35,58 +32,32 @@ class FeatureExtractor:
         with open(config_path, 'r') as f:
             self.config = yaml.safe_load(f)
 
-    def compute_features(self, df: pd.DataFrame,
-                         window_seconds: float = 5.0,
-                         sample_hz: int = 10):
+    def compute_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Apply YAML fallback logic and rolling-window aggregation.
+        Apply YAML fallback logic to produce a time-series DataFrame of
+        abstract features. Each column in the output corresponds to one
+        feature defined in the YAML registry.
+
+        The rule engine is responsible for windowed aggregation and
+        temporal evaluation — this layer only resolves raw signals into
+        version-agnostic feature columns.
 
         Returns:
-            tuple: (scalar_features: dict, timeseries_features: pd.DataFrame)
-                - scalar_features: one value per feature for the rule engine
-                - timeseries_features: full time-series for visualization
+            pd.DataFrame with one column per feature, same index as input.
         """
-        window_size = int(window_seconds * sample_hz)
         timeseries = pd.DataFrame(index=df.index)
 
         for feat_name, rules in self.config['features'].items():
             series = self._resolve_feature(feat_name, rules, df)
             timeseries[feat_name] = series
 
-        # Rolling window aggregation → scalar features
-        scalar_features = {}
-        windowed = timeseries.rolling(window=window_size, min_periods=1)
-
-        for feat_name, rules in self.config['features'].items():
-            agg = rules.get('aggregation', 'max')
-            try:
-                if agg == 'max':
-                    scalar_features[feat_name] = float(windowed[feat_name].max().max())
-                elif agg == 'min':
-                    scalar_features[feat_name] = float(windowed[feat_name].min().min())
-                elif agg == 'mean':
-                    scalar_features[feat_name] = float(windowed[feat_name].mean().mean())
-                elif agg == 'std':
-                    scalar_features[feat_name] = float(windowed[feat_name].std().max())
-                elif agg == 'last':
-                    scalar_features[feat_name] = float(timeseries[feat_name].iloc[-1])
-                else:
-                    scalar_features[feat_name] = float(windowed[feat_name].max().max())
-            except (TypeError, ValueError):
-                scalar_features[feat_name] = np.nan
-
-        logger.info("Extracted %d features: %s",
-                     len(scalar_features),
-                     {k: round(v, 2) if not np.isnan(v) else 'NaN'
-                      for k, v in scalar_features.items()})
-
-        return scalar_features, timeseries
+        logger.info("Extracted %d feature time-series, %d rows each.",
+                     len(timeseries.columns), len(timeseries))
+        return timeseries
 
     def _resolve_feature(self, name: str, rules: dict,
                          df: pd.DataFrame) -> pd.Series:
-        """
-        Resolve a single feature using the priority/fallback chain.
-        """
+        """Resolve a single feature using the priority/fallback chain."""
         # Try priority_1 first
         primary = rules.get('priority_1')
         if primary and primary in df.columns:
@@ -100,99 +71,146 @@ class FeatureExtractor:
                 logger.debug("  %s → priority_1 '%s' missing, using fallback",
                              name, primary)
             else:
-                logger.debug("  %s → computing from fallback expression", name)
+                logger.debug("  %s → computing from fallback expression",
+                             name)
             return self._eval_safe_expr(fallback, df, name)
 
         # Nothing available
         logger.warning("  %s → no data source available, filling NaN", name)
         return pd.Series(np.nan, index=df.index)
 
+    # ------------------------------------------------------------------ #
+    #  Safe AST-based expression evaluator                                 #
+    # ------------------------------------------------------------------ #
     def _eval_safe_expr(self, expr: str, df: pd.DataFrame,
                         feat_name: str) -> pd.Series:
         """
-        Safely evaluate an expression like:
-          abs(${ATT.DesRoll} - ${ATT.Roll})
-          max(${RCOU.C1}, ${RCOU.C2}, ${RCOU.C3}, ${RCOU.C4})
+        Safely evaluate a math expression like:
+            abs(${ATT.DesRoll} - ${ATT.Roll})
+            max(${RCOU.C1}, ${RCOU.C2}, ${RCOU.C3}, ${RCOU.C4})
 
-        Without using eval(). Supports:
+        Uses Python's ast module to parse the expression tree and evaluate
+        it node-by-node against pandas Series. No eval() is used.
+
+        Supported:
           - Column references: ${COL.NAME}
           - Arithmetic: +, -, *, /
           - Functions: abs(), max(), min(), sqrt()
+          - Numeric literals
         """
         # Check all referenced columns exist
-        refs = _COL_REF.findall(expr)
+        refs = _COL_REF_PATTERN.findall(expr)
         missing = [r for r in refs if r not in df.columns]
         if missing:
-            logger.warning(
-                "  %s → fallback references missing columns: %s",
-                feat_name, missing,
-            )
+            logger.warning("  %s → fallback references missing columns: %s",
+                           feat_name, missing)
             return pd.Series(np.nan, index=df.index)
 
-        # Handle function-style expressions: max(...), min(...), abs(...)
-        # Check if expression is a function call like max(${A}, ${B}, ...)
-        func_match = re.match(r'^(\w+)\((.+)\)$', expr.strip())
-        if func_match:
-            func_name = func_match.group(1)
-            args_str = func_match.group(2)
+        # Replace ${COL.NAME} with safe placeholder variable names
+        # e.g., ${ATT.Roll} → __ATT_Roll__
+        col_map = {}  # placeholder_name → column_name
+        safe_expr = expr
+        for col in refs:
+            placeholder = '__' + col.replace('.', '_') + '__'
+            col_map[placeholder] = col
+            safe_expr = safe_expr.replace('${' + col + '}', placeholder)
 
-            if func_name in ('max', 'min'):
-                # Split args by comma, resolve each
-                arg_exprs = [a.strip() for a in args_str.split(',')]
-                series_list = []
-                for arg in arg_exprs:
-                    s = self._resolve_column_or_simple(arg, df)
-                    if s is not None:
-                        series_list.append(s)
-                if not series_list:
-                    return pd.Series(np.nan, index=df.index)
-                result = series_list[0]
-                reducer = np.maximum if func_name == 'max' else np.minimum
-                for s in series_list[1:]:
-                    result = reducer(result, s)
+        # Parse the expression into an AST
+        try:
+            tree = ast.parse(safe_expr, mode='eval')
+        except SyntaxError as e:
+            logger.warning("  %s → failed to parse expression '%s': %s",
+                           feat_name, safe_expr, e)
+            return pd.Series(np.nan, index=df.index)
+
+        # Evaluate the AST
+        try:
+            result = self._eval_node(tree.body, df, col_map)
+            if isinstance(result, (int, float)):
+                return pd.Series(result, index=df.index)
+            return result
+        except Exception as e:
+            logger.warning("  %s → failed to evaluate expression: %s",
+                           feat_name, e)
+            return pd.Series(np.nan, index=df.index)
+
+    def _eval_node(self, node, df: pd.DataFrame,
+                   col_map: dict):
+        """
+        Recursively evaluate an AST node, returning a pandas Series or
+        scalar.
+        """
+        # --- Numeric literal ---
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, (int, float)):
+                return node.value
+            raise ValueError(f"Unsupported constant type: {type(node.value)}")
+
+        # --- Variable name (column reference placeholder) ---
+        if isinstance(node, ast.Name):
+            placeholder = node.id
+            if placeholder in col_map:
+                return df[col_map[placeholder]]
+            raise ValueError(f"Unknown variable: {placeholder}")
+
+        # --- Unary operator: -x, +x ---
+        if isinstance(node, ast.UnaryOp):
+            operand = self._eval_node(node.operand, df, col_map)
+            if isinstance(node.op, ast.USub):
+                return -operand
+            if isinstance(node.op, ast.UAdd):
+                return operand
+            raise ValueError(f"Unsupported unary op: {type(node.op)}")
+
+        # --- Binary operator: x + y, x - y, x * y, x / y ---
+        if isinstance(node, ast.BinOp):
+            left = self._eval_node(node.left, df, col_map)
+            right = self._eval_node(node.right, df, col_map)
+            ops = {
+                ast.Add: operator.add,
+                ast.Sub: operator.sub,
+                ast.Mult: operator.mul,
+                ast.Div: operator.truediv,
+            }
+            op_func = ops.get(type(node.op))
+            if op_func is None:
+                raise ValueError(f"Unsupported binary op: {type(node.op)}")
+            return op_func(left, right)
+
+        # --- Function call: abs(), max(), min(), sqrt() ---
+        if isinstance(node, ast.Call):
+            if not isinstance(node.func, ast.Name):
+                raise ValueError("Only simple function calls are supported")
+
+            func_name = node.func.id
+            args = [self._eval_node(arg, df, col_map) for arg in node.args]
+
+            if func_name == 'abs':
+                if len(args) != 1:
+                    raise ValueError("abs() requires exactly 1 argument")
+                return np.abs(args[0])
+
+            if func_name == 'sqrt':
+                if len(args) != 1:
+                    raise ValueError("sqrt() requires exactly 1 argument")
+                return np.sqrt(args[0])
+
+            if func_name == 'max':
+                if len(args) < 2:
+                    raise ValueError("max() requires at least 2 arguments")
+                result = args[0]
+                for a in args[1:]:
+                    result = np.maximum(result, a)
                 return result
 
-            elif func_name == 'abs':
-                inner = self._resolve_arithmetic(args_str, df)
-                return np.abs(inner) if inner is not None else pd.Series(np.nan, index=df.index)
+            if func_name == 'min':
+                if len(args) < 2:
+                    raise ValueError("min() requires at least 2 arguments")
+                result = args[0]
+                for a in args[1:]:
+                    result = np.minimum(result, a)
+                return result
 
-            elif func_name == 'sqrt':
-                inner = self._resolve_column_or_simple(args_str, df)
-                return np.sqrt(inner) if inner is not None else pd.Series(np.nan, index=df.index)
+            raise ValueError(f"Unsupported function: {func_name}")
 
-        # Plain arithmetic expression: ${A} - ${B}, ${A} + ${B}, etc.
-        return self._resolve_arithmetic(expr, df)
-
-    def _resolve_arithmetic(self, expr: str, df: pd.DataFrame) -> pd.Series:
-        """Resolve simple binary arithmetic: ${A} op ${B}"""
-        # Try to split on +, -, *, /
-        for op_char, op_func in [('+', lambda a, b: a + b),
-                                  ('-', lambda a, b: a - b),
-                                  ('*', lambda a, b: a * b),
-                                  ('/', lambda a, b: a / b)]:
-            # Split on the operator, but not inside ${...}
-            parts = re.split(r'(?<!\$\{[^}]*)\s*\%s\s*' % re.escape(op_char), expr)
-            if len(parts) == 2:
-                left = self._resolve_column_or_simple(parts[0].strip(), df)
-                right = self._resolve_column_or_simple(parts[1].strip(), df)
-                if left is not None and right is not None:
-                    return op_func(left, right)
-
-        # If no operator found, try as a single column reference
-        return self._resolve_column_or_simple(expr, df)
-
-    def _resolve_column_or_simple(self, token: str,
-                                   df: pd.DataFrame):
-        """Resolve a ${COL} reference or a numeric literal."""
-        token = token.strip()
-        col_match = _COL_REF.match(token)
-        if col_match:
-            col = col_match.group(1)
-            if col in df.columns:
-                return df[col]
-            return None
-        # Try parsing as a float constant
-        try:
-            return float(token)
-        except ValueError:
-            return None
+        raise ValueError(f"Unsupported AST node type: {type(node)}")

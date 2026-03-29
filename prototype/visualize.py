@@ -1,15 +1,14 @@
 """
 visualize.py — Diagnostic Telemetry Visualization
 
-Generates multi-panel plots of raw telemetry signals, with fault-window
-shading to highlight where the rule engine detected an anomaly. Each
-triggered rule specifies which signals to plot via plot_signals in rules.yaml.
+Generates multi-panel plots of raw telemetry signals, with EXACT fault-window
+shading using the fault_start and fault_end timestamps returned by the
+temporal rule engine. No more derivative-based guessing.
 """
 import logging
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +26,8 @@ def generate_diagnostic_plot(df: pd.DataFrame,
     Generate a multi-panel diagnostic plot based on triggered rules.
 
     Each triggered rule gets its own subplot showing the relevant signals.
-    A red-shaded region highlights where the fault was most severe.
+    The exact fault window (fault_start → fault_end from the rule engine)
+    is highlighted with a colored shaded region.
 
     Args:
         df: The raw resampled telemetry DataFrame from ingestion.
@@ -43,7 +43,8 @@ def generate_diagnostic_plot(df: pd.DataFrame,
         return
 
     n_panels = len(faults)
-    fig, axes = plt.subplots(n_panels, 1, figsize=(14, 4.5 * n_panels),
+    fig, axes = plt.subplots(n_panels, 1,
+                              figsize=(14, 4.5 * n_panels),
                               sharex=True)
     if n_panels == 1:
         axes = [axes]
@@ -55,14 +56,21 @@ def generate_diagnostic_plot(df: pd.DataFrame,
         rule_name = fault.get('rule_name', 'unknown')
         severity = fault.get('severity', 'WARNING')
         confidence = fault.get('confidence', 0)
+        fault_start = fault.get('fault_start')
+        fault_end = fault.get('fault_end')
+        duration = fault.get('fault_duration_s', 0)
+
+        # Convert index to seconds for plotting
+        time_seconds = df.index.total_seconds()
 
         # Plot each signal requested by the rule
         plotted = 0
         for i, sig in enumerate(signals):
             if sig in df.columns:
                 color = COLORS[i % len(COLORS)]
-                ax.plot(df.index.total_seconds(), df[sig],
-                        label=sig, color=color, linewidth=1.5, alpha=0.85)
+                ax.plot(time_seconds, df[sig],
+                        label=sig, color=color,
+                        linewidth=1.5, alpha=0.85)
                 plotted += 1
 
         if plotted == 0:
@@ -70,14 +78,27 @@ def generate_diagnostic_plot(df: pd.DataFrame,
                     transform=ax.transAxes, ha='center', va='center',
                     fontsize=11, color='gray')
 
-        # Add fault-window shading
-        _shade_fault_window(ax, df, signals, severity)
+        # Shade the EXACT fault window from the rule engine
+        if fault_start is not None and fault_end is not None:
+            fs = fault_start.total_seconds()
+            fe = fault_end.total_seconds()
+            sev_color = '#e74c3c' if severity == 'CRITICAL' else '#f39c12'
+            ax.axvspan(fs, fe, alpha=0.15, color=sev_color,
+                       label=f'Fault Window ({duration:.1f}s)')
+            # Add vertical lines at fault boundaries
+            ax.axvline(fs, color=sev_color, linestyle='--',
+                       alpha=0.6, linewidth=1)
+            ax.axvline(fe, color=sev_color, linestyle='--',
+                       alpha=0.6, linewidth=1)
 
         # Title & formatting
-        sev_color = '#e74c3c' if severity == 'CRITICAL' else '#f39c12'
+        sev_color_text = '#e74c3c' if severity == 'CRITICAL' else '#f39c12'
         title = (f'[{severity}] {rule_name.replace("_", " ").title()} '
                  f'— Confidence: {confidence:.0%}')
-        ax.set_title(title, fontsize=13, fontweight='bold', color=sev_color)
+        if duration > 0:
+            title += f'  (Duration: {duration:.1f}s)'
+        ax.set_title(title, fontsize=13, fontweight='bold',
+                     color=sev_color_text)
         ax.legend(loc='upper left', fontsize=9, framealpha=0.9)
         ax.grid(True, alpha=0.3)
         ax.set_ylabel('Value', fontsize=10)
@@ -93,38 +114,12 @@ def generate_diagnostic_plot(df: pd.DataFrame,
     logger.info("Diagnostic plot saved to %s", output_path)
 
 
-def _shade_fault_window(ax, df, signals, severity):
-    """
-    Shade the time region where the fault is most severe.
-    Uses the derivative of the first available signal to find the
-    sharpest change.
-    """
-    for sig in signals:
-        if sig not in df.columns:
-            continue
-        series = df[sig].dropna()
-        if len(series) < 10:
-            continue
-
-        # Find where the signal deviates most from its initial value
-        diff = (series - series.iloc[:10].mean()).abs()
-        threshold = diff.quantile(0.8)
-        fault_mask = diff > threshold
-
-        if fault_mask.any():
-            fault_start = series.index[fault_mask].min().total_seconds()
-            fault_end = series.index[fault_mask].max().total_seconds()
-            color = '#e74c3c' if severity == 'CRITICAL' else '#f39c12'
-            ax.axvspan(fault_start, fault_end,
-                       alpha=0.12, color=color, label='_fault_window')
-            break
-
-
 def _plot_overview(df: pd.DataFrame, output_path: str):
     """Fallback: plot an overview of all signals when no faults are found."""
     fig, ax = plt.subplots(figsize=(14, 6))
+    time_seconds = df.index.total_seconds()
     for i, col in enumerate(df.columns[:8]):
-        ax.plot(df.index.total_seconds(), df[col],
+        ax.plot(time_seconds, df[col],
                 label=col, color=COLORS[i % len(COLORS)], alpha=0.7)
     ax.set_title('Log Overview — No Faults Detected', fontsize=14,
                  fontweight='bold', color='#2ecc71')

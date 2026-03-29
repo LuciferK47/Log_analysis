@@ -1,0 +1,64 @@
+{
+  "log_file": "dummy.bin",
+  "scenario": "motor_loss",
+  "rows_analyzed": 200,
+  "features_computed": [
+    "roll_tracking_error",
+    "pitch_tracking_error",
+    "motor_output_max",
+    "motor_output_min",
+    "motor_output_spread",
+    "gps_hdop",
+    "gps_nsats",
+    "ekf_pos_variance",
+    "vibe_x",
+    "vibe_clip_count",
+    "batt_voltage_min"
+  ],
+  "findings": [
+    {
+      "status": "FAULT_DETECTED",
+      "rule_name": "motor_loss",
+      "root_cause": "motor_loss",
+      "severity": "CRITICAL",
+      "confidence": 0.941,
+      "description": "A motor, ESC, or propeller has failed. The flight controller tries to compensate by saturating the opposite motor, causing attitude divergence.",
+      "evidence": [
+        {
+          "feature": "roll_tracking_error",
+          "operator": ">",
+          "threshold": 15.0,
+          "peak_value": 45.0,
+          "mean_value": 40.68
+        },
+        {
+          "feature": "motor_output_max",
+          "operator": ">",
+          "threshold": 1900.0,
+          "peak_value": 2000.0,
+          "mean_value": 1952.02
+        },
+        {
+          "feature": "motor_output_spread",
+          "operator": ">",
+          "threshold": 300.0,
+          "peak_value": 900.0,
+          "mean_value": 813.64
+        }
+      ],
+      "fault_start": 18.0,
+      "fault_end": 19.9,
+      "fault_duration_s": 1.9,
+      "suggested_fix": "Inspect all motors and ESCs for physical damage. Check propeller balance. Review RCOU channels to identify which motor saturated.",
+      "plot_signals": [
+        "ATT.Roll",
+        "ATT.DesRoll",
+        "RCOU.C1",
+        "RCOU.C2",
+        "RCOU.C3",
+        "RCOU.C4"
+      ]
+    }
+  ],
+  "elapsed_seconds": 0.048
+}

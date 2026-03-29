@@ -2,7 +2,7 @@
 cli.py — ArduPilot Log Diagnostic Tool (CLI)
 
 Entry point that ties the full pipeline together:
-  Log Ingestion → Feature Abstraction → Rule Engine → Visualization
+  Log Ingestion → Feature Abstraction → Temporal Rule Engine → Visualization
 
 Usage:
   # Analyze a real SITL crash log
@@ -20,6 +20,8 @@ import logging
 import os
 import sys
 import time
+
+import pandas as pd
 
 from ingestion import LogReader
 from abstraction import FeatureExtractor
@@ -61,22 +63,46 @@ def print_finding(finding: dict, index: int):
     color = SEVERITY_COLORS.get(severity, RESET)
     rule = finding.get('rule_name', 'unknown').replace('_', ' ').title()
     conf = finding.get('confidence', 0)
+    duration = finding.get('fault_duration_s', 0)
 
     print(f"  {color}{BOLD}[{severity}] Finding #{index}: {rule}{RESET}")
     print(f"    Confidence : {conf:.0%}")
+
+    # Print fault window
+    fs = finding.get('fault_start')
+    fe = finding.get('fault_end')
+    if fs is not None and fe is not None:
+        print(f"    Fault Window: {fs.total_seconds():.1f}s → "
+              f"{fe.total_seconds():.1f}s  "
+              f"(duration: {duration:.1f}s)")
+
     print(f"    Description: {finding.get('description', 'N/A')}")
 
     evidence = finding.get('evidence', [])
     if evidence:
         print(f"    Evidence:")
         for e in evidence:
-            print(f"      • {e['feature']}: {e['value']} "
+            peak = e.get('peak_value', '?')
+            print(f"      • {e['feature']}: peak={peak} "
                   f"({e['operator']} {e['threshold']})")
 
     fix = finding.get('suggested_fix', '')
     if fix:
         print(f"    {YELLOW}Suggested Fix: {fix}{RESET}")
     print()
+
+
+def _serialize_finding(finding: dict) -> dict:
+    """Make a finding dict JSON-serializable (convert Timedeltas to floats)."""
+    out = {}
+    for k, v in finding.items():
+        if isinstance(v, pd.Timedelta):
+            out[k] = v.total_seconds()
+        elif isinstance(v, list):
+            out[k] = v  # evidence list is already serializable
+        else:
+            out[k] = v
+    return out
 
 
 def main():
@@ -128,14 +154,17 @@ Examples:
 
     # ── Auto-detect config files relative to this script ─────────────────
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    config_path = args.config or os.path.join(script_dir, 'feature_registry.yaml')
+    config_path = args.config or os.path.join(script_dir,
+                                               'feature_registry.yaml')
     rules_path = args.rules or os.path.join(script_dir, 'rules.yaml')
 
     if not os.path.exists(config_path):
-        print(f"{RED}Error: Feature registry not found at {config_path}{RESET}")
+        print(f"{RED}Error: Feature registry not found at "
+              f"{config_path}{RESET}")
         sys.exit(1)
     if not os.path.exists(rules_path):
-        print(f"{RED}Error: Rules file not found at {rules_path}{RESET}")
+        print(f"{RED}Error: Rules file not found at "
+              f"{rules_path}{RESET}")
         sys.exit(1)
 
     t_start = time.time()
@@ -145,6 +174,7 @@ Examples:
     reader = LogReader(args.log)
     df = reader.read_and_resample(
         target_hz=10,
+        config_path=config_path,
         generate_dummy=args.dummy,
     )
 
@@ -157,14 +187,14 @@ Examples:
     # ── Stage 2: Feature Abstraction ─────────────────────────────────────
     print(f"{CYAN}[2/4] Feature Abstraction...{RESET}")
     extractor = FeatureExtractor(config_path)
-    scalar_features, timeseries = extractor.compute_features(df)
+    features_ts = extractor.compute_features(df)
 
-    print(f"  → {len(scalar_features)} features computed.")
+    print(f"  → {len(features_ts.columns)} feature time-series computed.")
 
-    # ── Stage 3: Rule Evaluation ─────────────────────────────────────────
-    print(f"{CYAN}[3/4] Rule Evaluation...{RESET}")
-    engine = RuleEngine(rules_path)
-    findings = engine.evaluate(scalar_features)
+    # ── Stage 3: Temporal Rule Evaluation ────────────────────────────────
+    print(f"{CYAN}[3/4] Temporal Rule Evaluation...{RESET}")
+    engine = RuleEngine(rules_path, sample_hz=10, min_fault_seconds=1.0)
+    findings = engine.evaluate(features_ts)
 
     # ── Stage 4: Output ──────────────────────────────────────────────────
     elapsed = time.time() - t_start
@@ -176,18 +206,20 @@ Examples:
 
     # ── Optional: Generate diagnostic plot ───────────────────────────────
     if args.plot:
-        print(f"{CYAN}Generating diagnostic plot → {args.plot_output}{RESET}")
+        print(f"{CYAN}Generating diagnostic plot → "
+              f"{args.plot_output}{RESET}")
         generate_diagnostic_plot(df, findings, args.plot_output)
         print(f"  → Saved to {args.plot_output}")
 
     # ── Optional: Save JSON report ───────────────────────────────────────
+    serializable_findings = [_serialize_finding(f) for f in findings]
+
     report = {
         'log_file': args.log,
         'scenario': args.dummy or 'real_log',
         'rows_analyzed': len(df),
-        'features': {k: round(v, 4) if not (v != v) else None
-                     for k, v in scalar_features.items()},
-        'findings': findings,
+        'features_computed': list(features_ts.columns),
+        'findings': serializable_findings,
         'elapsed_seconds': round(elapsed, 3),
     }
 
