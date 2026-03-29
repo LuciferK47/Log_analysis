@@ -1,0 +1,9 @@
+# Extracted text
+Gsoc_26.txt
+
+# Python
+__pycache__/
+*.pyc
+
+# Local ArduPilot clone (managed via setup_sitl.sh)
+ardupilot/

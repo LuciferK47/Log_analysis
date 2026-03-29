@@ -1,0 +1,87 @@
+# ============================================================================
+# Feature Registry — Version-Agnostic Telemetry Abstraction
+# ============================================================================
+# Each feature defines:
+#   priority_1    : The preferred raw column name (firmware-specific)
+#   fallback      : An expression using ${COLUMN} syntax if priority_1 is absent
+#   aggregation   : How to reduce a rolling window (max | mean | std | min | last)
+#   unit          : Physical unit (for plot axis labels)
+#   description   : Human-readable explanation
+# ============================================================================
+
+features:
+
+  # ---- Motor / Attitude ----
+  roll_tracking_error:
+    priority_1: "ATT.ErrRP"
+    fallback: "abs(${ATT.DesRoll} - ${ATT.Roll})"
+    aggregation: "max"
+    unit: "degrees"
+    description: "Peak attitude roll error — gap between desired and actual roll."
+
+  pitch_tracking_error:
+    priority_1: "ATT.ErrDP"
+    fallback: "abs(${ATT.DesPitch} - ${ATT.Pitch})"
+    aggregation: "max"
+    unit: "degrees"
+    description: "Peak attitude pitch error."
+
+  motor_output_max:
+    priority_1: "RCOU.C1"
+    fallback: "max(${RCOU.C1}, ${RCOU.C2}, ${RCOU.C3}, ${RCOU.C4})"
+    aggregation: "max"
+    unit: "PWM (µs)"
+    description: "Highest PWM output across all motor channels."
+
+  motor_output_min:
+    priority_1: "RCOU.C3"
+    fallback: "min(${RCOU.C1}, ${RCOU.C2}, ${RCOU.C3}, ${RCOU.C4})"
+    aggregation: "min"
+    unit: "PWM (µs)"
+    description: "Lowest PWM output — indicates a dead/failing motor."
+
+  motor_output_spread:
+    fallback: "max(${RCOU.C1}, ${RCOU.C2}, ${RCOU.C3}, ${RCOU.C4}) - min(${RCOU.C1}, ${RCOU.C2}, ${RCOU.C3}, ${RCOU.C4})"
+    aggregation: "max"
+    unit: "PWM (µs)"
+    description: "Spread between highest and lowest motor output — indicates asymmetric load."
+
+  # ---- GPS ----
+  gps_hdop:
+    priority_1: "GPS.HDop"
+    aggregation: "max"
+    unit: "HDop"
+    description: "Horizontal dilution of precision — spikes indicate GPS problems."
+
+  gps_nsats:
+    priority_1: "GPS.NSats"
+    aggregation: "min"
+    unit: "count"
+    description: "Minimum satellite count during the window."
+
+  # ---- EKF ----
+  ekf_pos_variance:
+    priority_1: "NKF4.SP"
+    aggregation: "max"
+    unit: "ratio"
+    description: "EKF position innovation variance — >1.0 indicates EKF stress."
+
+  # ---- Vibration ----
+  vibe_x:
+    priority_1: "VIBE.VibeX"
+    aggregation: "max"
+    unit: "m/s²"
+    description: "Peak X-axis vibration."
+
+  vibe_clip_count:
+    priority_1: "VIBE.Clip0"
+    aggregation: "last"
+    unit: "count"
+    description: "Cumulative IMU clipping events — non-zero is bad."
+
+  # ---- Battery ----
+  batt_voltage_min:
+    priority_1: "BATT.Volt"
+    aggregation: "min"
+    unit: "V"
+    description: "Minimum battery voltage during the window."
