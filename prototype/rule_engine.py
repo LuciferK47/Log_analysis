@@ -1,14 +1,13 @@
 """
-rule_engine.py — Temporal, YAML-Driven Diagnostic Rule Engine
+rule_engine.py — Temporal, Mode-Aware, YAML-Driven Diagnostic Rule Engine
 
 Evaluates diagnostic rules against the FULL feature time-series DataFrame.
-Each rule specifies a `duration_seconds` hysteresis threshold — the combined
-condition must be simultaneously True for that many consecutive seconds
-before the rule triggers. This prevents false positives from brief noise
-spikes in real telemetry.
+Each rule specifies:
+  - duration_seconds: hysteresis (minimum sustained True time)
+  - ignored_modes: list of flight modes where the rule is suppressed
 
-Each triggered finding includes exact fault_start and fault_end timestamps
-for precise visualization shading.
+This prevents false positives from both noise spikes AND expected behaviour
+in manual/acrobatic flight modes.
 """
 import logging
 import numpy as np
@@ -17,7 +16,6 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
-# Operator dispatch table — returns boolean Series
 _OPERATORS = {
     '>':  lambda series, thresh: series > thresh,
     '>=': lambda series, thresh: series >= thresh,
@@ -26,52 +24,47 @@ _OPERATORS = {
     '==': lambda series, thresh: series == thresh,
 }
 
-# Default duration if not specified in the YAML rule
 _DEFAULT_DURATION_SECONDS = 1.0
 
 
 class RuleEngine:
     """
-    Evaluates declarative diagnostic rules against feature time-series.
-    Rules trigger only when all conditions are simultaneously true for
-    the per-rule `duration_seconds` hysteresis window.
+    Evaluates declarative diagnostic rules against feature time-series,
+    with per-rule hysteresis and flight-mode awareness.
     """
 
     def __init__(self, rules_path: str, sample_hz: int = 10):
-        """
-        Args:
-            rules_path: Path to rules.yaml
-            sample_hz: Sampling rate of the input DataFrame (used to
-                       convert duration_seconds to sample counts).
-        """
         with open(rules_path, 'r') as f:
             self.rules_config = yaml.safe_load(f)
         self.sample_hz = sample_hz
 
-    def evaluate(self, features_ts: pd.DataFrame) -> list[dict]:
+    def evaluate(self, features_ts: pd.DataFrame,
+                 events: list[dict] = None) -> list[dict]:
         """
-        Evaluate all rules against the feature time-series DataFrame.
+        Evaluate all rules against the feature time-series.
+        Optionally cross-references MSG/ERR events within fault windows.
 
         Args:
-            features_ts: DataFrame from abstraction layer with one column
-                         per abstract feature, indexed by timedelta.
+            features_ts: DataFrame with feature columns + __flight_mode__.
+            events: List of MSG/ERR event dicts from LogReader.
 
         Returns:
-            List of triggered diagnostic findings, sorted by confidence.
-            Each finding includes fault_start, fault_end, and
-            fault_duration_s.
+            List of triggered findings, sorted by confidence.
         """
         findings = []
+        events = events or []
 
         for rule_name, rule in self.rules_config['rules'].items():
-            result = self._eval_single_rule(rule_name, rule, features_ts)
+            result = self._eval_single_rule(
+                rule_name, rule, features_ts, events
+            )
             if result is not None:
                 findings.append(result)
 
         findings.sort(key=lambda f: f['confidence'], reverse=True)
 
         if not findings:
-            logger.info("No faults detected — all rules passed.")
+            logger.info("No faults detected.")
             return [{
                 'status': 'OK',
                 'root_cause': 'none',
@@ -83,23 +76,17 @@ class RuleEngine:
         return findings
 
     def _eval_single_rule(self, rule_name: str, rule: dict,
-                          features_ts: pd.DataFrame) -> dict | None:
-        """
-        Evaluate one rule with per-rule hysteresis.
-
-        The rule's `duration_seconds` field determines how long the
-        combined condition must be continuously True before triggering.
-        """
+                          features_ts: pd.DataFrame,
+                          events: list[dict]) -> dict | None:
         conditions = rule.get('conditions', [])
         logic = rule.get('logic', 'AND').upper()
-
-        # Per-rule hysteresis from YAML
         duration_s = float(
             rule.get('duration_seconds', _DEFAULT_DURATION_SECONDS)
         )
         min_samples = max(1, int(duration_s * self.sample_hz))
+        ignored_modes = rule.get('ignored_modes', [])
 
-        # Build a boolean mask per condition
+        # Build per-condition boolean masks
         condition_masks = []
         evidence = []
 
@@ -109,15 +96,12 @@ class RuleEngine:
             threshold = float(cond['threshold'])
 
             if feat_name not in features_ts.columns:
-                logger.debug("  %s: feature '%s' not in DataFrame",
-                             rule_name, feat_name)
                 condition_masks.append(
                     pd.Series(False, index=features_ts.index)
                 )
                 continue
 
             series = features_ts[feat_name]
-
             if series.isna().all():
                 condition_masks.append(
                     pd.Series(False, index=features_ts.index)
@@ -126,8 +110,6 @@ class RuleEngine:
 
             op_func = _OPERATORS.get(op_str)
             if op_func is None:
-                logger.warning("Unknown operator '%s' in rule '%s'",
-                               op_str, rule_name)
                 condition_masks.append(
                     pd.Series(False, index=features_ts.index)
                 )
@@ -135,7 +117,6 @@ class RuleEngine:
 
             mask = op_func(series, threshold).fillna(False)
             condition_masks.append(mask)
-
             evidence.append({
                 'feature': feat_name,
                 'operator': op_str,
@@ -155,15 +136,26 @@ class RuleEngine:
             for m in condition_masks[1:]:
                 combined = combined | m
 
-        # Find sustained fault with the per-rule duration
+        # ── Flight-mode suppression ──────────────────────────────────
+        if ignored_modes and '__flight_mode__' in features_ts.columns:
+            mode_col = features_ts['__flight_mode__']
+            suppressed = mode_col.isin(ignored_modes)
+            suppressed_count = (combined & suppressed).sum()
+            if suppressed_count > 0:
+                logger.debug(
+                    "  %s: suppressed %d samples in modes %s",
+                    rule_name, suppressed_count, ignored_modes,
+                )
+            combined = combined & ~suppressed
+
+        # Find sustained fault
         fault_start, fault_end = self._find_sustained_fault(
             combined, min_samples
         )
-
         if fault_start is None:
             return None
 
-        # Enrich evidence with peak values during the fault window
+        # Enrich evidence with peak values
         for e in evidence:
             feat = e['feature']
             if feat in features_ts.columns:
@@ -186,6 +178,28 @@ class RuleEngine:
 
         fault_duration = (fault_end - fault_start).total_seconds()
 
+        # Determine the dominant flight mode during the fault
+        fault_mode = 'UNKNOWN'
+        if '__flight_mode__' in features_ts.columns:
+            mode_slice = features_ts.loc[
+                fault_start:fault_end, '__flight_mode__'
+            ]
+            if not mode_slice.empty:
+                fault_mode = mode_slice.mode().iloc[0]
+
+        # Collect MSG/ERR events that occurred during the fault window
+        fault_events = []
+        fs_sec = fault_start.total_seconds()
+        fe_sec = fault_end.total_seconds()
+        for evt in events:
+            evt_sec = evt.get('time_td', pd.Timedelta(0)).total_seconds()
+            if fs_sec - 2.0 <= evt_sec <= fe_sec + 2.0:
+                fault_events.append({
+                    'time_s': round(evt_sec, 2),
+                    'type': evt.get('type', ''),
+                    'text': evt.get('text', ''),
+                })
+
         finding = {
             'status': 'FAULT_DETECTED',
             'rule_name': rule_name,
@@ -198,31 +212,25 @@ class RuleEngine:
             'fault_end': fault_end,
             'fault_duration_s': round(fault_duration, 2),
             'duration_threshold_s': duration_s,
+            'flight_mode': fault_mode,
+            'events_in_window': fault_events,
             'suggested_fix': rule.get('suggested_fix', '').strip(),
             'plot_signals': rule.get('plot_signals', []),
         }
 
         logger.info(
-            "Rule '%s' TRIGGERED (confidence: %.2f, "
-            "window: %.1fs–%.1fs, duration: %.1fs, "
-            "required: %.1fs)",
+            "Rule '%s' TRIGGERED (conf=%.2f, window=%.1fs–%.1fs, "
+            "duration=%.1fs, mode=%s, events=%d)",
             rule_name, base_conf,
             fault_start.total_seconds(), fault_end.total_seconds(),
-            fault_duration, duration_s,
+            fault_duration, fault_mode, len(fault_events),
         )
         return finding
 
-    def _find_sustained_fault(self, mask: pd.Series,
-                              min_samples: int):
-        """
-        Find the longest consecutive run of True values in the boolean
-        mask that lasts at least min_samples. Returns (start, end)
-        timestamps or (None, None).
-        """
+    def _find_sustained_fault(self, mask: pd.Series, min_samples: int):
         if not mask.any():
             return None, None
 
-        # Label consecutive True-runs using cumsum of ~mask
         groups = (~mask).cumsum()
         true_groups = groups[mask]
         if true_groups.empty:
@@ -234,8 +242,6 @@ class RuleEngine:
         if valid_groups.empty:
             return None, None
 
-        # Pick the longest sustained fault
-        longest_group_id = valid_groups.idxmax()
-        fault_indices = true_groups[true_groups == longest_group_id].index
-
+        longest_id = valid_groups.idxmax()
+        fault_indices = true_groups[true_groups == longest_id].index
         return fault_indices[0], fault_indices[-1]

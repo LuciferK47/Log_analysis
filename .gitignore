@@ -13,6 +13,7 @@ ardupilot/
 *.png
 *.jpg
 *.json
+*.html
 !feature_registry.yaml
 !rules.yaml
 

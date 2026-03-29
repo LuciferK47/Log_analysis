@@ -21,6 +21,7 @@ rules:
       A motor, ESC, or propeller has failed. The flight controller
       tries to compensate by saturating the opposite motor, causing
       attitude divergence.
+    ignored_modes: ["ACRO", "MANUAL", "FLIP"]
     conditions:
       - feature: "roll_tracking_error"
         operator: ">"

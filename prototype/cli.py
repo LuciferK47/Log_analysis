@@ -1,18 +1,13 @@
 """
 cli.py — ArduPilot Log Diagnostic Tool (CLI)
 
-Entry point that ties the full pipeline together:
-  Log Ingestion → Feature Abstraction → Temporal Rule Engine → Visualization
+Entry point:
+  Log Ingestion → Feature Abstraction → Temporal Rule Engine → Plotly Report
 
-Usage:
-  # Analyze a real SITL crash log
-  python cli.py --log path/to/flight.bin
-
-  # Quick demo with simulated motor failure
-  python cli.py --dummy motor_loss
-
-  # Analyze with custom rules and generate a plot
-  python cli.py --log flight.bin --rules my_rules.yaml --plot
+Outputs:
+  - Colored terminal diagnostics with fault windows, flight modes, and events
+  - Interactive HTML report (Plotly) for pan/zoom/hover analysis
+  - JSON machine-readable report
 """
 import argparse
 import json
@@ -28,12 +23,13 @@ from abstraction import FeatureExtractor
 from rule_engine import RuleEngine
 from visualize import generate_diagnostic_plot
 
-# ── ANSI colors for terminal output ──────────────────────────────────────
+# ── ANSI colors ──────────────────────────────────────────────────────────
 RED = '\033[91m'
 YELLOW = '\033[93m'
 GREEN = '\033[92m'
 CYAN = '\033[96m'
 BOLD = '\033[1m'
+DIM = '\033[2m'
 RESET = '\033[0m'
 
 SEVERITY_COLORS = {
@@ -52,8 +48,22 @@ def print_banner():
 """)
 
 
+def print_metadata(reader: 'LogReader'):
+    """Print extracted vehicle metadata."""
+    if reader.metadata:
+        print(f"  {BOLD}Vehicle Config:{RESET}")
+        for k, v in reader.metadata.items():
+            print(f"    {k}: {v}")
+    if reader.mode_changes:
+        modes = [m['mode'] for m in reader.mode_changes]
+        print(f"  {BOLD}Flight Modes:{RESET} {' → '.join(modes)}")
+    if reader.events:
+        print(f"  {BOLD}Log Events:{RESET} {len(reader.events)} "
+              f"MSG/ERR messages recorded")
+    print()
+
+
 def print_finding(finding: dict, index: int):
-    """Pretty-print a single diagnostic finding."""
     status = finding.get('status', 'OK')
     if status == 'OK':
         print(f"  {GREEN}{BOLD}✓ No anomalies detected.{RESET}")
@@ -64,19 +74,19 @@ def print_finding(finding: dict, index: int):
     rule = finding.get('rule_name', 'unknown').replace('_', ' ').title()
     conf = finding.get('confidence', 0)
     duration = finding.get('fault_duration_s', 0)
+    mode = finding.get('flight_mode', 'UNKNOWN')
 
     print(f"  {color}{BOLD}[{severity}] Finding #{index}: {rule}{RESET}")
-    print(f"    Confidence : {conf:.0%}")
+    print(f"    Confidence  : {conf:.0%}")
 
-    # Print fault window
     fs = finding.get('fault_start')
     fe = finding.get('fault_end')
     if fs is not None and fe is not None:
         print(f"    Fault Window: {fs.total_seconds():.1f}s → "
               f"{fe.total_seconds():.1f}s  "
               f"(duration: {duration:.1f}s)")
-
-    print(f"    Description: {finding.get('description', 'N/A')}")
+    print(f"    Flight Mode : {mode}")
+    print(f"    Description : {finding.get('description', 'N/A')}")
 
     evidence = finding.get('evidence', [])
     if evidence:
@@ -86,6 +96,14 @@ def print_finding(finding: dict, index: int):
             print(f"      • {e['feature']}: peak={peak} "
                   f"({e['operator']} {e['threshold']})")
 
+    # Print correlated events
+    fault_events = finding.get('events_in_window', [])
+    if fault_events:
+        print(f"    {DIM}Correlated Events:{RESET}")
+        for evt in fault_events[:5]:
+            print(f"      {DIM}[{evt['time_s']:.1f}s] "
+                  f"{evt['type']}: {evt['text']}{RESET}")
+
     fix = finding.get('suggested_fix', '')
     if fix:
         print(f"    {YELLOW}Suggested Fix: {fix}{RESET}")
@@ -93,13 +111,12 @@ def print_finding(finding: dict, index: int):
 
 
 def _serialize_finding(finding: dict) -> dict:
-    """Make a finding dict JSON-serializable (convert Timedeltas to floats)."""
     out = {}
     for k, v in finding.items():
         if isinstance(v, pd.Timedelta):
             out[k] = v.total_seconds()
         elif isinstance(v, list):
-            out[k] = v  # evidence list is already serializable
+            out[k] = v
         else:
             out[k] = v
     return out
@@ -107,42 +124,37 @@ def _serialize_finding(finding: dict) -> dict:
 
 def main():
     parser = argparse.ArgumentParser(
-        description='ArduPilot Log Diagnostic Tool — '
-                    'AI-Assisted Root-Cause Detection',
+        description='ArduPilot Log Diagnostic Tool',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python cli.py --log flight.bin
-  python cli.py --dummy motor_loss
-  python cli.py --dummy gps_glitch --plot --output report.json
-  python cli.py --log flight.bin --rules custom_rules.yaml --plot
+  python3 cli.py --log flight.BIN --plot -v
+  python3 cli.py --dummy motor_loss --plot
+  python3 cli.py --log flight.BIN --plot --output report.json
         """,
     )
 
     parser.add_argument('--log', type=str, default='dummy.bin',
                         help='Path to .bin DataFlash log file')
     parser.add_argument('--config', type=str, default=None,
-                        help='Path to feature_registry.yaml '
-                             '(default: auto-detect)')
+                        help='Path to feature_registry.yaml')
     parser.add_argument('--rules', type=str, default=None,
-                        help='Path to rules.yaml (default: auto-detect)')
+                        help='Path to rules.yaml')
     parser.add_argument('--dummy', type=str, default=None,
                         choices=['motor_loss', 'gps_glitch', 'vibration'],
-                        help='Use a simulated fault scenario instead of '
-                             'a real log')
+                        help='Simulated fault scenario')
     parser.add_argument('--plot', action='store_true',
-                        help='Generate diagnostic visualization')
+                        help='Generate interactive HTML diagnostic report')
     parser.add_argument('--plot-output', type=str,
-                        default='diagnostic_report.png',
-                        help='Output path for the diagnostic plot')
+                        default='diagnostic_report.html',
+                        help='Output path for the HTML report')
     parser.add_argument('--output', type=str, default=None,
-                        help='Save JSON report to this file path')
+                        help='Save JSON report to this path')
     parser.add_argument('--verbose', '-v', action='store_true',
                         help='Enable debug logging')
 
     args = parser.parse_args()
 
-    # ── Setup logging ────────────────────────────────────────────────────
     log_level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(
         level=log_level,
@@ -152,10 +164,10 @@ Examples:
 
     print_banner()
 
-    # ── Auto-detect config files relative to this script ─────────────────
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    config_path = args.config or os.path.join(script_dir,
-                                               'feature_registry.yaml')
+    config_path = args.config or os.path.join(
+        script_dir, 'feature_registry.yaml'
+    )
     rules_path = args.rules or os.path.join(script_dir, 'rules.yaml')
 
     if not os.path.exists(config_path):
@@ -183,18 +195,24 @@ Examples:
         sys.exit(1)
 
     print(f"  → {len(df)} rows, {len(df.columns)} columns extracted.")
+    print_metadata(reader)
 
     # ── Stage 2: Feature Abstraction ─────────────────────────────────────
     print(f"{CYAN}[2/4] Feature Abstraction...{RESET}")
     extractor = FeatureExtractor(config_path)
     features_ts = extractor.compute_features(df)
 
-    print(f"  → {len(features_ts.columns)} feature time-series computed.")
+    # Carry the flight mode column through
+    if '__flight_mode__' in df.columns:
+        features_ts['__flight_mode__'] = df['__flight_mode__']
+
+    print(f"  → {len(features_ts.columns) - 1} feature time-series "
+          f"computed.")
 
     # ── Stage 3: Temporal Rule Evaluation ────────────────────────────────
     print(f"{CYAN}[3/4] Temporal Rule Evaluation...{RESET}")
-    engine = RuleEngine(rules_path, sample_hz=10, min_fault_seconds=1.0)
-    findings = engine.evaluate(features_ts)
+    engine = RuleEngine(rules_path, sample_hz=10)
+    findings = engine.evaluate(features_ts, events=reader.events)
 
     # ── Stage 4: Output ──────────────────────────────────────────────────
     elapsed = time.time() - t_start
@@ -204,32 +222,41 @@ Examples:
     for i, finding in enumerate(findings, 1):
         print_finding(finding, i)
 
-    # ── Optional: Generate diagnostic plot ───────────────────────────────
+    # ── Optional: Interactive HTML report ────────────────────────────────
     if args.plot:
-        print(f"{CYAN}Generating diagnostic plot → "
+        print(f"{CYAN}Generating interactive report → "
               f"{args.plot_output}{RESET}")
-        generate_diagnostic_plot(df, findings, args.plot_output)
-        print(f"  → Saved to {args.plot_output}")
+        generate_diagnostic_plot(
+            df, findings,
+            events=reader.events,
+            output_path=args.plot_output,
+        )
+        print(f"  → Open {args.plot_output} in a browser to "
+              f"pan, zoom, and inspect the telemetry.")
 
-    # ── Optional: Save JSON report ───────────────────────────────────────
+    # ── Optional: JSON report ────────────────────────────────────────────
     serializable_findings = [_serialize_finding(f) for f in findings]
 
     report = {
         'log_file': args.log,
         'scenario': args.dummy or 'real_log',
+        'vehicle_metadata': reader.metadata,
+        'mode_changes': reader.mode_changes,
         'rows_analyzed': len(df),
-        'features_computed': list(features_ts.columns),
+        'features_computed': [
+            c for c in features_ts.columns if not c.startswith('__')
+        ],
         'findings': serializable_findings,
         'elapsed_seconds': round(elapsed, 3),
     }
 
     if args.output:
         with open(args.output, 'w') as f:
-            json.dump(report, f, indent=2)
+            json.dump(report, f, indent=2, default=str)
         print(f"\n  {GREEN}JSON report saved to {args.output}{RESET}")
     else:
         print(f"\n{BOLD}--- JSON Report ---{RESET}")
-        print(json.dumps(report, indent=2))
+        print(json.dumps(report, indent=2, default=str))
 
 
 if __name__ == '__main__':
