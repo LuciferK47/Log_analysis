@@ -1,138 +1,78 @@
 # ============================================================================
-# Diagnostic Rules — Declarative Failure Heuristics
-# ============================================================================
-# Each rule defines:
-#   conditions       : list of feature thresholds
-#   logic            : AND | OR (how conditions combine)
-#   duration_seconds : minimum consecutive seconds the combined condition must
-#                      be True to trigger (hysteresis to reject noise spikes)
-#   severity         : CRITICAL | WARNING | INFO
-#   confidence       : base confidence (0.0–1.0)
-#   suggested_fix    : human-readable recommendation
-#   plot_signals     : raw telemetry columns to plot when this rule triggers
-#
-# Community contributors: add your own rules below! Each rule is independent.
+# Diagnostic Rules — Declarative Failure Heuristics (Upgraded)
 # ============================================================================
 
 rules:
-
-  motor_loss:
-    description: >
-      A motor, ESC, or propeller has failed. The flight controller
-      tries to compensate by saturating the opposite motor, causing
-      attitude divergence.
-    ignored_modes: ["ACRO", "MANUAL", "FLIP"]
-    conditions:
-      - feature: "roll_tracking_error"
-        operator: ">"
-        threshold: 15
-      - feature: "motor_output_max"
-        operator: ">"
-        threshold: 1900
-      - feature: "motor_output_spread"
-        operator: ">"
-        threshold: 300
-    logic: "AND"
-    duration_seconds: 1.5
+  R001:
+    id: "R001"
+    name: "Primary Power Collapse"
+    category: "Hardware/Power"
+    description: "Battery voltage sagged below critical threshold for a sustained period."
     severity: "CRITICAL"
-    confidence: 0.90
-    suggested_fix: >
-      Inspect all motors and ESCs for physical damage. Check propeller
-      balance. Review RCOU channels to identify which motor saturated.
-    plot_signals:
-      - "ATT.Roll"
-      - "ATT.DesRoll"
-      - "RCOU.C1"
-      - "RCOU.C2"
-      - "RCOU.C3"
-      - "RCOU.C4"
-
-  gps_glitch:
-    description: >
-      GPS position data became unreliable, causing EKF position
-      innovation to spike. May be caused by interference, spoofing,
-      or flying near structures.
-    conditions:
-      - feature: "gps_hdop"
-        operator: ">"
-        threshold: 2.5
-      - feature: "ekf_pos_variance"
-        operator: ">"
-        threshold: 0.8
-    logic: "AND"
-    duration_seconds: 2.0
-    severity: "CRITICAL"
-    confidence: 0.85
-    suggested_fix: >
-      Check GPS antenna placement and shielding. Review NKF4.SP for
-      EKF innovation spikes. Consider enabling GPS blending if using
-      dual GPS.
-    plot_signals:
-      - "GPS.HDop"
-      - "NKF4.SP"
-      - "GPS.NSats"
-
-  excessive_vibration:
-    description: >
-      Motor or frame vibration exceeded safe limits, causing IMU
-      clipping and potentially corrupting EKF estimates.
-    conditions:
-      - feature: "vibe_x"
-        operator: ">"
-        threshold: 30
-      - feature: "vibe_clip_count"
-        operator: ">"
-        threshold: 0
-    logic: "AND"
-    duration_seconds: 1.0
-    severity: "WARNING"
-    confidence: 0.88
-    suggested_fix: >
-      Balance propellers, check motor mounts, and inspect the flight
-      controller mounting for vibration isolation. Review VIBE logs.
-    plot_signals:
-      - "VIBE.VibeX"
-      - "VIBE.VibeY"
-      - "VIBE.VibeZ"
-      - "VIBE.Clip0"
-
-  battery_sag:
-    description: >
-      Battery voltage dropped below safe levels under load, risking
-      brownout and loss of control.
+    streams:
+      required: ["batt_voltage_min"]
+      optional: []
     conditions:
       - feature: "batt_voltage_min"
         operator: "<"
-        threshold: 14.0
+        threshold: 10.5
     logic: "AND"
-    duration_seconds: 3.0
-    severity: "WARNING"
-    confidence: 0.80
-    suggested_fix: >
-      Check battery health and internal resistance. Reduce payload
-      or use a higher-capacity battery. Review BATT.Volt vs throttle.
+    windows:
+      macro_window_sec: 2.0
+      micro_window_sec: null
+    causality:
+      is_root_cause_candidate: true
+      symptoms: ["R002", "R003"]
     plot_signals:
       - "BATT.Volt"
+      - "BATT.Curr"
 
-  ekf_divergence:
-    description: >
-      EKF innovation ratios exceeded 1.0 without a clear single-sensor
-      fault, indicating general navigation filter stress.
+  R002:
+    id: "R002"
+    name: "EKF Primary Core Divergence"
+    category: "Navigation/EKF"
+    description: "EKF velocity or position innovations breached limits."
+    severity: "HIGH"
+    streams:
+      required: ["ekf_pos_variance"]
+      optional: []
     conditions:
       - feature: "ekf_pos_variance"
         operator: ">"
         threshold: 1.0
-      - feature: "gps_hdop"
-        operator: "<"
-        threshold: 2.0
     logic: "AND"
-    duration_seconds: 2.0
-    severity: "WARNING"
-    confidence: 0.70
-    suggested_fix: >
-      Review NKF4 lane status. Check for magnetic interference or
-      rapid manoeuvres that stress the EKF. Consider re-calibrating
-      the compass and accelerometer.
+    windows:
+      macro_window_sec: null
+      micro_window_sec: 0.1
+    causality:
+      is_root_cause_candidate: true
+      symptoms: ["R004"]
+      demote_if_preceded_by: ["R001", "R005"]
     plot_signals:
       - "NKF4.SP"
-      - "GPS.HDop"
+      - "NKF4.SV"
+
+  R005:
+    id: "R005"
+    name: "Physical Impact / Crash Detected"
+    category: "Hardware/Airframe"
+    description: "Massive instantaneous acceleration spike indicating a physical impact."
+    severity: "CRITICAL"
+    streams:
+      required: ["vibe_x"] 
+      optional: []
+    conditions:
+      - feature: "vibe_x"
+        operator: ">"
+        threshold: 60
+    logic: "AND"
+    windows:
+      macro_window_sec: null
+      micro_window_sec: 0.05
+    causality:
+      is_root_cause_candidate: true
+      symptoms: ["ALL_SENSOR_NOISE", "R002"]
+    plot_signals:
+      - "VIBE.VibeX"
+      - "VIBE.VibeY"
+      - "VIBE.VibeZ"
