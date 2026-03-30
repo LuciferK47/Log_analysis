@@ -1,9 +1,5 @@
 """
 rule_engine.py — Temporal, Mode-Aware, YAML-Driven Diagnostic Rule Engine
-
-Evaluates diagnostic rules against the FULL feature time-series DataFrame,
-now featuring adaptive temporal scopes and a Causal Arbiter to suppress
-downstream symptoms.
 """
 import logging
 import numpy as np
@@ -25,14 +21,10 @@ class CausalArbiter:
         self.ruleset = {rule.get('id', k): rule for k, rule in ruleset.items()}
         self.logger = logging.getLogger(__name__)
 
-    def analyze_sequence(self, triggered_events: list) -> dict:
-        """
-        Sorts triggered events chronologically and applies causal demotion logic.
-        """
+    def analyze_sequence(self, triggered_events: list, within_seconds: float = 30.0) -> dict:
         if not triggered_events:
             return {"root_causes": [], "downstream_symptoms": []}
 
-        # Sort by the exact timestamp the rule FIRST became true
         triggered_events.sort(key=lambda x: x['fault_start'])
 
         root_causes = []
@@ -49,12 +41,18 @@ class CausalArbiter:
             predecessors = rule.get('causality', {}).get('demote_if_preceded_by', [])
             
             for predecessor_id in predecessors:
-                if any((r.get('rule_id') == predecessor_id or r.get('rule_name') == predecessor_id) for r in root_causes):
-                    demoted = True
-                    event['confidence'] = min(event.get('confidence', 0.2), 0.2)
-                    event['root_cause_ref'] = predecessor_id
-                    suppressed_symptoms.append(event)
-                    self.logger.info(f"Demoting {rule_id} as a symptom of {predecessor_id}")
+                for r in root_causes:
+                    if r.get('rule_id') == predecessor_id or r.get('rule_name') == predecessor_id:
+                        # Only demote if the predecessor occurred within `within_seconds` before this event
+                        time_diff = abs((event['fault_start'] - r['fault_start']).total_seconds())
+                        if time_diff <= within_seconds:
+                            demoted = True
+                            event['confidence'] = min(event.get('confidence', 0.2), 0.2)
+                            event['root_cause_ref'] = predecessor_id
+                            suppressed_symptoms.append(event)
+                            self.logger.info(f"Demoting {rule_id} as a symptom of {predecessor_id} (dt={time_diff:.1f}s)")
+                            break
+                if demoted:
                     break
             
             if not demoted:
@@ -99,10 +97,8 @@ class RuleEngine:
             logger.info("No faults detected.")
             return []
 
-        # Pass through causal arbiter
         causal_results = self.arbiter.analyze_sequence(findings)
         
-        # Combine them but sorted by confidence
         all_findings = causal_results['root_causes'] + causal_results['downstream_symptoms']
         all_findings.sort(key=lambda f: f['confidence'], reverse=True)
         return all_findings
@@ -113,13 +109,12 @@ class RuleEngine:
         conditions = rule.get('conditions', [])
         logic = rule.get('logic', 'AND').upper()
         
-        # Handle adaptive windows
         windows = rule.get('windows', {})
         macro_s = windows.get('macro_window_sec')
         micro_s = windows.get('micro_window_sec')
-        duration_s = macro_s if macro_s else micro_s if micro_s else 1.0
         
-        min_samples = max(1, int(duration_s * self.sample_hz))
+        macro_samples = max(1, int(macro_s * self.sample_hz)) if macro_s else None
+        micro_samples = max(1, int(micro_s * self.sample_hz)) if micro_s else None
         ignored_modes = rule.get('ignored_modes', [])
 
         condition_masks = []
@@ -168,7 +163,9 @@ class RuleEngine:
             suppressed = mode_col.isin(ignored_modes)
             combined = combined & ~suppressed
 
-        fault_start, fault_end = self._find_sustained_fault(combined, min_samples)
+        fault_start, fault_end, triggered_window = self._find_sustained_fault_adaptive(
+            combined, macro_samples, micro_samples
+        )
         if fault_start is None:
             return None
 
@@ -203,21 +200,33 @@ class RuleEngine:
             'flight_mode': fault_mode,
             'events_in_window': [],
             'plot_signals': rule.get('plot_signals', []),
+            'triggered_window': triggered_window
         }
 
         return finding
 
-    def _find_sustained_fault(self, mask: pd.Series, min_samples: int):
+    def _find_sustained_fault_adaptive(self, mask: pd.Series, macro_samples: int = None, micro_samples: int = None):
         if not mask.any():
-            return None, None
+            return None, None, None
+        
         groups = (~mask).cumsum()
         true_groups = groups[mask]
         if true_groups.empty:
-            return None, None
+            return None, None, None
+            
         group_sizes = true_groups.groupby(true_groups).size()
-        valid_groups = group_sizes[group_sizes >= min_samples]
-        if valid_groups.empty:
-            return None, None
-        longest_id = valid_groups.idxmax()
+        
+        longest_id = group_sizes.idxmax()
+        max_size = group_sizes[longest_id]
+        
+        triggered_window = None
+        if macro_samples and max_size >= macro_samples:
+            triggered_window = "macro"
+        elif micro_samples and max_size >= micro_samples:
+            triggered_window = "micro"
+            
+        if not triggered_window:
+            return None, None, None
+            
         fault_indices = true_groups[true_groups == longest_id].index
-        return fault_indices[0], fault_indices[-1]
+        return fault_indices[0], fault_indices[-1], triggered_window

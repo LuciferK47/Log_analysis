@@ -76,3 +76,105 @@ rules:
       - "VIBE.VibeX"
       - "VIBE.VibeY"
       - "VIBE.VibeZ"
+
+  GPS_Degradation:
+    id: "GPS_Degradation"
+    name: "Severe GPS Degradation"
+    category: "Navigation/GPS"
+    description: "Drop in satellites combined with high HDOP indicating unreliable GPS."
+    severity: "CRITICAL"
+    streams:
+      required: ["gps_hdop", "gps_nsats"]
+      optional: []
+    conditions:
+      - feature: "gps_hdop"
+        operator: ">"
+        threshold: 2.5
+      - feature: "gps_nsats"
+        operator: "<"
+        threshold: 6
+    logic: "AND"
+    windows:
+      macro_window_sec: null
+      micro_window_sec: 1.0
+    causality:
+      is_root_cause_candidate: true
+      symptoms: ["R002"]
+    plot_signals:
+      - "GPS.HDop"
+      - "GPS.NSats"
+
+  Motor_Hardware_Failure:
+    id: "Motor_Hardware_Failure"
+    name: "Motor/ESC Hardware Failure"
+    category: "Hardware/Motor"
+    description: "RCOU channel spikes to maximum while attitude error remains high."
+    severity: "CRITICAL"
+    streams:
+      required: ["rcou_c1", "att_err_roll"]
+      optional: []
+    conditions:
+      - feature: "rcou_c1"
+        operator: ">"
+        threshold: 1900
+      - feature: "att_err_roll"
+        operator: ">"
+        threshold: 15
+    logic: "AND"
+    windows:
+      macro_window_sec: null
+      micro_window_sec: 0.5
+    causality:
+      is_root_cause_candidate: true
+      symptoms: ["R005"]
+    plot_signals:
+      - "RCOU.C1"
+      - "ATT.Roll"
+      - "ATT.DesRoll"
+
+  Radio_Failsafe:
+    id: "Radio_Failsafe"
+    name: "Radio Control Failsafe"
+    category: "Communications"
+    description: "RC input dropped to 0 indicating lost link."
+    severity: "CRITICAL"
+    streams:
+      required: ["rcin_c1"]
+      optional: []
+    conditions:
+      - feature: "rcin_c1"
+        operator: "=="
+        threshold: 0
+    logic: "AND"
+    windows:
+      macro_window_sec: null
+      micro_window_sec: 1.5
+    causality:
+      is_root_cause_candidate: true
+      symptoms: []
+    plot_signals:
+      - "RCIN.C1"
+
+  Severe_Current_Fluctuation:
+    id: "Severe_Current_Fluctuation"
+    name: "Severe Current Fluctuation"
+    category: "Hardware/Power"
+    description: "High BATT.Curr draw sustained over time."
+    severity: "WARNING"
+    streams:
+      required: ["batt_curr"]
+      optional: ["batt_voltage_min"]
+    conditions:
+      - feature: "batt_curr"
+        operator: ">"
+        threshold: 50.0
+    logic: "AND"
+    windows:
+      macro_window_sec: 10.0
+      micro_window_sec: null
+    causality:
+      is_root_cause_candidate: true
+      symptoms: ["R001"]
+    plot_signals:
+      - "BATT.Curr"
+      - "BATT.Volt"

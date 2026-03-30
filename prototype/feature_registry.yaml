@@ -85,3 +85,29 @@ features:
     aggregation: "min"
     unit: "V"
     description: "Minimum battery voltage during the window."
+
+  # ---- New Edge Case Features ----
+  batt_curr:
+    priority_1: "BATT.Curr"
+    aggregation: "max"
+    unit: "A"
+    description: "Peak battery current draw."
+
+  rcin_c1:
+    priority_1: "RCIN.C1"
+    aggregation: "min"
+    unit: "PWM (µs)"
+    description: "Radio control input channel 1. Drops to 0 on failsafe."
+
+  att_err_roll:
+    priority_1: "ATT.ErrRP"
+    fallback: "abs(${ATT.DesRoll} - ${ATT.Roll})"
+    aggregation: "max"
+    unit: "degrees"
+    description: "Attitude error specifically on the Roll axis."
+
+  rcou_c1:
+    priority_1: "RCOU.C1"
+    aggregation: "max"
+    unit: "PWM (µs)"
+    description: "Motor 1 raw output."

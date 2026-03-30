@@ -36,6 +36,8 @@ def generate_diagnostic_plot(df: pd.DataFrame, findings: list, events: list = No
         signals = fault.get('plot_signals', [])
         fault_start = fault.get('fault_start')
         fault_end = fault.get('fault_end')
+        
+        is_symptom = bool(fault.get('root_cause_ref'))
 
         for sig in signals:
             if sig in df.columns:
@@ -44,8 +46,13 @@ def generate_diagnostic_plot(df: pd.DataFrame, findings: list, events: list = No
         if fault_start is not None and fault_end is not None:
             fs = fault_start.total_seconds()
             fe = fault_end.total_seconds()
-            ax.axvspan(fs, fe, color='red', alpha=0.3, label='Fault Window')
-            ax.set_title(f"[{fault.get('severity')}] {fault.get('rule_name')} (Conf: {fault.get('confidence'):.2f})")
+            
+            fill_color = 'orange' if is_symptom else 'red'
+            fill_alpha = 0.2 if is_symptom else 0.3
+            title_prefix = "[SYMPTOM]" if is_symptom else "[ROOT CAUSE]"
+            
+            ax.axvspan(fs, fe, color=fill_color, alpha=fill_alpha, label=f"{title_prefix} Window")
+            ax.set_title(f"{title_prefix} [{fault.get('severity')}] {fault.get('rule_name')} (Conf: {fault.get('confidence'):.2f})")
             
         ax.legend()
         ax.grid(True, alpha=0.3)
