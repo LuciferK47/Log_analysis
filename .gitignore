@@ -10,9 +10,7 @@ __pycache__/
 ardupilot/
 
 # Generated diagnostic outputs (never commit these)
-*.png
 *.jpg
-*.json
 *.html
 !feature_registry.yaml
 !rules.yaml

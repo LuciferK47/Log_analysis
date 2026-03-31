@@ -1,0 +1,75 @@
+{
+    "status": "success",
+    "metadata": {
+        "FRAME_TYPE": 2.0,
+        "INS_LOG_BAT_OPT": 0.0,
+        "BATT_CAPACITY": 3300.0,
+        "MOT_PWM_MIN": 0.0,
+        "MOT_PWM_MAX": 0.0,
+        "FRAME_CLASS": 1.0
+    },
+    "primary_root_cause": {
+        "status": "FAULT_DETECTED",
+        "rule_id": "R005",
+        "rule_name": "Physical Impact / Crash Detected",
+        "severity": "CRITICAL",
+        "confidence": 0.95,
+        "description": "Massive instantaneous acceleration spike indicating a physical impact.",
+        "evidence": [
+            {
+                "feature": "vibe_x",
+                "operator": ">",
+                "threshold": 60.0,
+                "peak_value": 82.97,
+                "mean_value": 72.01
+            }
+        ],
+        "fault_start": 1522.153188,
+        "fault_end": 1522.753188,
+        "fault_duration_s": 0.6,
+        "flight_mode": "UNKNOWN",
+        "events_in_window": [],
+        "plot_signals": [
+            "VIBE.VibeX",
+            "VIBE.VibeY",
+            "VIBE.VibeZ"
+        ],
+        "triggered_window": "micro"
+    },
+    "causal_chain": {
+        "root_causes": [
+            {
+                "status": "FAULT_DETECTED",
+                "rule_id": "R005",
+                "rule_name": "Physical Impact / Crash Detected",
+                "severity": "CRITICAL",
+                "confidence": 0.95,
+                "description": "Massive instantaneous acceleration spike indicating a physical impact.",
+                "evidence": [
+                    {
+                        "feature": "vibe_x",
+                        "operator": ">",
+                        "threshold": 60.0,
+                        "peak_value": 82.97,
+                        "mean_value": 72.01
+                    }
+                ],
+                "fault_start": 1522.153188,
+                "fault_end": 1522.753188,
+                "fault_duration_s": 0.6,
+                "flight_mode": "UNKNOWN",
+                "events_in_window": [],
+                "plot_signals": [
+                    "VIBE.VibeX",
+                    "VIBE.VibeY",
+                    "VIBE.VibeZ"
+                ],
+                "triggered_window": "micro"
+            }
+        ],
+        "downstream_symptoms": []
+    },
+    "artifacts": {
+        "diagnostic_plot_path": "analysis_results/2022-02-11_12-47-48_plot.png"
+    }
+}

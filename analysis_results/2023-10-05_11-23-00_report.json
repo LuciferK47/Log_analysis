@@ -1,0 +1,87 @@
+{
+    "status": "success",
+    "metadata": {
+        "FRAME_TYPE": 1.0,
+        "INS_LOG_BAT_OPT": 0.0,
+        "BATT_CAPACITY": 3300.0,
+        "MOT_PWM_MIN": 1000.0,
+        "MOT_PWM_MAX": 2000.0,
+        "FRAME_CLASS": 1.0
+    },
+    "primary_root_cause": {
+        "status": "FAULT_DETECTED",
+        "rule_id": "GPS_Degradation",
+        "rule_name": "Severe GPS Degradation",
+        "severity": "CRITICAL",
+        "confidence": 0.95,
+        "description": "Drop in satellites combined with high HDOP indicating unreliable GPS.",
+        "evidence": [
+            {
+                "feature": "gps_hdop",
+                "operator": ">",
+                "threshold": 2.5,
+                "peak_value": 99.99,
+                "mean_value": 99.99
+            },
+            {
+                "feature": "gps_nsats",
+                "operator": "<",
+                "threshold": 6.0,
+                "peak_value": 0.0,
+                "mean_value": 0.0
+            }
+        ],
+        "fault_start": 19.404913,
+        "fault_end": 38.904913,
+        "fault_duration_s": 19.5,
+        "flight_mode": "UNKNOWN",
+        "events_in_window": [],
+        "plot_signals": [
+            "GPS.HDop",
+            "GPS.NSats"
+        ],
+        "triggered_window": "micro"
+    },
+    "causal_chain": {
+        "root_causes": [
+            {
+                "status": "FAULT_DETECTED",
+                "rule_id": "GPS_Degradation",
+                "rule_name": "Severe GPS Degradation",
+                "severity": "CRITICAL",
+                "confidence": 0.95,
+                "description": "Drop in satellites combined with high HDOP indicating unreliable GPS.",
+                "evidence": [
+                    {
+                        "feature": "gps_hdop",
+                        "operator": ">",
+                        "threshold": 2.5,
+                        "peak_value": 99.99,
+                        "mean_value": 99.99
+                    },
+                    {
+                        "feature": "gps_nsats",
+                        "operator": "<",
+                        "threshold": 6.0,
+                        "peak_value": 0.0,
+                        "mean_value": 0.0
+                    }
+                ],
+                "fault_start": 19.404913,
+                "fault_end": 38.904913,
+                "fault_duration_s": 19.5,
+                "flight_mode": "UNKNOWN",
+                "events_in_window": [],
+                "plot_signals": [
+                    "GPS.HDop",
+                    "GPS.NSats"
+                ],
+                "triggered_window": "micro"
+            }
+        ],
+        "downstream_symptoms": []
+    },
+    "artifacts": {
+        "diagnostic_plot_path": "analysis_results/2023-10-05_11-23-00_plot.png"
+    }
+}

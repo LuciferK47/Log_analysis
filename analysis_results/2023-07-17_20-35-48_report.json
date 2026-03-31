@@ -1,0 +1,19 @@
+{
+    "status": "ok",
+    "metadata": {
+        "FRAME_TYPE": 1.0,
+        "INS_LOG_BAT_OPT": 0.0,
+        "BATT_CAPACITY": 6000.0,
+        "MOT_PWM_MIN": 1000.0,
+        "MOT_PWM_MAX": 2000.0,
+        "FRAME_CLASS": 1.0
+    },
+    "primary_root_cause": null,
+    "causal_chain": {
+        "root_causes": [],
+        "downstream_symptoms": []
+    },
+    "artifacts": {
+        "diagnostic_plot_path": "analysis_results/2023-07-17_20-35-48_plot.png"
+    }
+}
