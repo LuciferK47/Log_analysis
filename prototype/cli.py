@@ -20,7 +20,6 @@ try:
 except ImportError:
     ArduPilotRAG = None
 
-# ── ANSI colors ──────────────────────────────────────────────────────────
 RED = '\033[91m'
 YELLOW = '\033[93m'
 GREEN = '\033[92m'
@@ -73,7 +72,6 @@ def main():
     engine = RuleEngine(rules_path, sample_hz=10)
     findings = engine.evaluate(features_ts, events=reader.events)
 
-    # ── RAG Pipeline Integration ───────────────────────────────────────────
     if findings and ArduPilotRAG is not None:
         print(f"{CYAN}[+] Querying RAG Pipeline for dynamic fixes...{RESET}")
         try:
@@ -84,7 +82,6 @@ def main():
         except Exception as e:
             logging.warning(f"RAG failed: {e}")
 
-    # ── Outputs ────────────────────────────────────────────────────────────
     print(f"{CYAN}[4/4] Generating Outputs...{RESET}")
     plot_path = generate_diagnostic_plot(df, findings, events=reader.events, output_path=args.plot_output)
 

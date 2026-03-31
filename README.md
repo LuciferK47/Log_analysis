@@ -55,6 +55,16 @@ python3 cli.py --dummy gps_glitch --plot -v
 python3 cli.py --dummy vibration --plot -v
 ```
 
+### Batch Analysis
+
+To process multiple `.bin` logs concurrently and generate reports/plots for all of them:
+
+```bash
+python3 batch_analyze.py
+```
+This will automatically scan the `Logs/` directory and output all JSON reports and PNG plots into the `analysis_results/` folder.
+
+
 ## How It Compares to MAVExplorer
 
 MAVExplorer is ArduPilot's standard log viewer — it's a manual graphing tool where a pilot selects signals to plot and visually inspects them. This prototype automates that process:
@@ -107,13 +117,18 @@ prototype/
 ├── abstraction.py          # YAML-driven feature extraction (AST-based math)
 ├── rule_engine.py          # Temporal rule evaluation with per-rule hysteresis
 ├── visualize.py            # Diagnostic plots with exact fault-window shading
+├── rag_pipeline.py         # Retrieval-Augmented Generation (ChromaDB) for context
+├── ingest_kb.py            # Knowledge base ingestion for RAG
 ├── feature_registry.yaml   # Feature definitions with version fallbacks
 ├── rules.yaml              # Diagnostic rules (community-extensible)
 ├── setup_sitl.sh           # SITL environment setup script
 └── requirements.txt        # Python dependencies
 docs/
-├── SITL_TUTORIAL.md        # Step-by-step guide for generating authentic test data
-└── images/                 # Authentic diagnostic plots (generated, not committed)
+├── SITL_TUTORIAL.md        # Step-by-step guide for test data
+└── images/                 # Authentic diagnostic plots
+batch_analyze.py            # Pipeline script for bulk log processing
+debug.py                    # Sandbox script for testing telemetry
+Proposal_2.tex              # Comprehensive GSoC 2026 LaTeX Proposal
 ```
 
 ## License

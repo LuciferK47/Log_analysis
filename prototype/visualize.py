@@ -24,7 +24,7 @@ def generate_diagnostic_plot(df: pd.DataFrame, findings: list, events: list = No
         plt.close(fig)
         return output_path
 
-    n_panels = min(len(faults), 4)  # Plot top 4 faults max
+    n_panels = min(len(faults), 4)
     fig, axes = plt.subplots(n_panels, 1, figsize=(12, 4 * n_panels), sharex=True)
     if n_panels == 1:
         axes = [axes]

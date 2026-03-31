@@ -20,7 +20,6 @@ logger = logging.getLogger(__name__)
 _COL_REF = re.compile(r'(?:\$\{)?([A-Z][A-Z0-9]+\.[A-Za-z0-9_]+)(?:\})?')
 _MSG_PREFIX = re.compile(r'^([A-Z][A-Z0-9]+)\.')
 
-# ArduPilot flight mode names by ModeNum (Copter)
 _COPTER_MODES = {
     0: 'STABILIZE', 1: 'ACRO', 2: 'ALT_HOLD', 3: 'AUTO',
     4: 'GUIDED', 5: 'LOITER', 6: 'RTL', 7: 'CIRCLE',
@@ -71,9 +70,9 @@ class LogReader:
 
     def __init__(self, filepath: str):
         self.filepath = filepath
-        self.metadata = {}       # PARM values: FRAME_CLASS, FRAME_TYPE, etc.
-        self.events = []         # MSG and ERR entries with timestamps
-        self.mode_changes = []   # MODE changes with timestamps
+        self.metadata = {}
+        self.events = []
+        self.mode_changes = []
 
     def read_and_resample(self, target_hz: int = 10,
                           config_path: str = None,
@@ -108,7 +107,6 @@ class LogReader:
                 break
             mtype = msg.get_type()
 
-            # ── PARM: vehicle configuration ──────────────────────────
             if mtype == 'PARM':
                 try:
                     name = msg.Name
@@ -121,7 +119,6 @@ class LogReader:
                     pass
                 continue
 
-            # ── MODE: flight mode changes ────────────────────────────
             if mtype == 'MODE':
                 try:
                     time_us = msg.TimeUS
@@ -141,7 +138,6 @@ class LogReader:
                     pass
                 continue
 
-            # ── MSG: text warnings from the flight controller ────────
             if mtype == 'MSG':
                 try:
                     self.events.append({
@@ -153,7 +149,6 @@ class LogReader:
                     pass
                 continue
 
-            # ── ERR: error codes ─────────────────────────────────────
             if mtype == 'ERR':
                 try:
                     self.events.append({
@@ -167,7 +162,6 @@ class LogReader:
                     pass
                 continue
 
-            # ── Telemetry: extract only needed fields ────────────────
             if mtype not in msg_types:
                 continue
 
@@ -179,7 +173,6 @@ class LogReader:
                     pass
             streams[mtype].append(row)
 
-        # Build DataFrames
         dfs = []
         for mtype, rows in streams.items():
             if not rows:
@@ -188,6 +181,7 @@ class LogReader:
             tdf = pd.DataFrame(rows)
             tdf['TimeUS'] = pd.to_timedelta(tdf['TimeUS'], unit='us')
             tdf = tdf.set_index('TimeUS')
+            tdf = tdf[~tdf.index.duplicated(keep='last')]
             dfs.append(tdf)
 
         if not dfs:
@@ -199,7 +193,6 @@ class LogReader:
         merged = merged.resample(f'{period_ms}ms').first()
         merged = merged.ffill().dropna(how='all')
 
-        # ── Forward-fill flight mode across the time-series ──────────
         if self.mode_changes:
             mode_df = pd.DataFrame(self.mode_changes)
             mode_df['TimeUS'] = pd.to_timedelta(mode_df['TimeUS'], unit='us')
@@ -210,7 +203,6 @@ class LogReader:
         else:
             merged['__flight_mode__'] = 'UNKNOWN'
 
-        # Convert event timestamps to timedeltas
         for evt in self.events:
             evt['time_td'] = pd.to_timedelta(evt['TimeUS'], unit='us')
 
@@ -222,9 +214,6 @@ class LogReader:
         )
         return merged
 
-    # ------------------------------------------------------------------ #
-    #  Dummy data generators                                               #
-    # ------------------------------------------------------------------ #
     def _generate_dummy_data(self, scenario: str = 'motor_loss') -> pd.DataFrame:
         generators = {
             'motor_loss': self._dummy_motor_loss,
@@ -236,7 +225,6 @@ class LogReader:
             raise ValueError(f"Unknown scenario '{scenario}'.")
         logger.info("Generating dummy '%s' scenario...", scenario)
 
-        # Populate dummy metadata
         self.metadata = {'FRAME_CLASS': 1, 'FRAME_TYPE': 1}
         self.mode_changes = [{'TimeUS': 0, 'mode': 'GUIDED', 'mode_num': 4}]
         self.events = [
@@ -276,7 +264,6 @@ class LogReader:
         df['GPS.NSats'] = 14.0
         df['NKF4.SP'] = np.random.normal(0.3, 0.05, n).clip(0.1)
 
-        # Flight mode column
         df['__flight_mode__'] = 'GUIDED'
         return df
 

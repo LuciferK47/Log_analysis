@@ -24,7 +24,6 @@ def main():
 
     os.makedirs(kb_dir, exist_ok=True)
     
-    # Create sample docs if directory is empty
     if not os.listdir(kb_dir):
         with open(os.path.join(kb_dir, "sample.txt"), "w") as f:
             f.write("Primary Power Collapse is often caused by a bad battery or overdrawing current. Check BATT.Volt logs.\n")

@@ -43,7 +43,6 @@ class CausalArbiter:
             for predecessor_id in predecessors:
                 for r in root_causes:
                     if r.get('rule_id') == predecessor_id or r.get('rule_name') == predecessor_id:
-                        # Only demote if the predecessor occurred within `within_seconds` before this event
                         time_diff = abs((event['fault_start'] - r['fault_start']).total_seconds())
                         if time_diff <= within_seconds:
                             demoted = True

@@ -21,7 +21,6 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
-# Regex to find ${COLUMN_NAME} references in fallback expressions
 _COL_REF_PATTERN = re.compile(r'\$\{([^}]+)\}')
 
 
@@ -58,13 +57,11 @@ class FeatureExtractor:
     def _resolve_feature(self, name: str, rules: dict,
                          df: pd.DataFrame) -> pd.Series:
         """Resolve a single feature using the priority/fallback chain."""
-        # Try priority_1 first
         primary = rules.get('priority_1')
         if primary and primary in df.columns:
             logger.debug("  %s → resolved via priority_1 (%s)", name, primary)
             return df[primary].copy()
 
-        # Try fallback expression
         fallback = rules.get('fallback')
         if fallback:
             if primary:
@@ -75,13 +72,9 @@ class FeatureExtractor:
                              name)
             return self._eval_safe_expr(fallback, df, name)
 
-        # Nothing available
         logger.warning("  %s → no data source available, filling NaN", name)
         return pd.Series(np.nan, index=df.index)
 
-    # ------------------------------------------------------------------ #
-    #  Safe AST-based expression evaluator                                 #
-    # ------------------------------------------------------------------ #
     def _eval_safe_expr(self, expr: str, df: pd.DataFrame,
                         feat_name: str) -> pd.Series:
         """
@@ -98,7 +91,6 @@ class FeatureExtractor:
           - Functions: abs(), max(), min(), sqrt()
           - Numeric literals
         """
-        # Check all referenced columns exist
         refs = _COL_REF_PATTERN.findall(expr)
         missing = [r for r in refs if r not in df.columns]
         if missing:
@@ -106,16 +98,13 @@ class FeatureExtractor:
                            feat_name, missing)
             return pd.Series(np.nan, index=df.index)
 
-        # Replace ${COL.NAME} with safe placeholder variable names
-        # e.g., ${ATT.Roll} → __ATT_Roll__
-        col_map = {}  # placeholder_name → column_name
+        col_map = {}
         safe_expr = expr
         for col in refs:
             placeholder = '__' + col.replace('.', '_') + '__'
             col_map[placeholder] = col
             safe_expr = safe_expr.replace('${' + col + '}', placeholder)
 
-        # Parse the expression into an AST
         try:
             tree = ast.parse(safe_expr, mode='eval')
         except SyntaxError as e:
@@ -123,7 +112,6 @@ class FeatureExtractor:
                            feat_name, safe_expr, e)
             return pd.Series(np.nan, index=df.index)
 
-        # Evaluate the AST
         try:
             result = self._eval_node(tree.body, df, col_map)
             if isinstance(result, (int, float)):
@@ -140,20 +128,17 @@ class FeatureExtractor:
         Recursively evaluate an AST node, returning a pandas Series or
         scalar.
         """
-        # --- Numeric literal ---
         if isinstance(node, ast.Constant):
             if isinstance(node.value, (int, float)):
                 return node.value
             raise ValueError(f"Unsupported constant type: {type(node.value)}")
 
-        # --- Variable name (column reference placeholder) ---
         if isinstance(node, ast.Name):
             placeholder = node.id
             if placeholder in col_map:
                 return df[col_map[placeholder]]
             raise ValueError(f"Unknown variable: {placeholder}")
 
-        # --- Unary operator: -x, +x ---
         if isinstance(node, ast.UnaryOp):
             operand = self._eval_node(node.operand, df, col_map)
             if isinstance(node.op, ast.USub):
@@ -162,7 +147,6 @@ class FeatureExtractor:
                 return operand
             raise ValueError(f"Unsupported unary op: {type(node.op)}")
 
-        # --- Binary operator: x + y, x - y, x * y, x / y ---
         if isinstance(node, ast.BinOp):
             left = self._eval_node(node.left, df, col_map)
             right = self._eval_node(node.right, df, col_map)
@@ -177,7 +161,6 @@ class FeatureExtractor:
                 raise ValueError(f"Unsupported binary op: {type(node.op)}")
             return op_func(left, right)
 
-        # --- Function call: abs(), max(), min(), sqrt() ---
         if isinstance(node, ast.Call):
             if not isinstance(node.func, ast.Name):
                 raise ValueError("Only simple function calls are supported")

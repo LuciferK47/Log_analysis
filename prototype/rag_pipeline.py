@@ -10,7 +10,6 @@ import functools
 
 class ArduPilotRAG:
     def __init__(self, db_path="./ardupilot_knowledge_base"):
-        # Local, in-memory/sqlite vector DB (no external server needed)
         try:
             import chromadb
             from chromadb.utils import embedding_functions
@@ -56,5 +55,4 @@ class ArduPilotRAG:
         Based ONLY on the documentation context provided, what is the recommended fix to prevent this issue in the future?
         """
         
-        # Simulated response for now
         return f"Simulated LLM Response based on root cause: {diagnosis_event.get('name', '')}."
