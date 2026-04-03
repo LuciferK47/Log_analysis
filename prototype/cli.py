@@ -1,13 +1,11 @@
 """
-cli.py — ArduPilot Log Diagnostic Tool (CLI) [Upgraded]
-Now featuring RAG pipeline, Causal Arbiter support and headless JSON output.
+cli.py — ArduPilot Log Diagnostic Tool (CLI) [DuckDB Iteration]
 """
 import argparse
 import json
 import logging
 import os
 import sys
-import time
 
 import pandas as pd
 
@@ -20,12 +18,8 @@ try:
 except ImportError:
     ArduPilotRAG = None
 
-RED = '\033[91m'
-YELLOW = '\033[93m'
-GREEN = '\033[92m'
 CYAN = '\033[96m'
-BOLD = '\033[1m'
-DIM = '\033[2m'
+GREEN = '\033[92m'
 RESET = '\033[0m'
 
 def _serialize_finding(finding: dict) -> dict:
@@ -58,19 +52,17 @@ def main():
     config_path = args.config or os.path.join(script_dir, 'feature_registry.yaml')
     rules_path = args.rules or os.path.join(script_dir, 'rules.yaml')
 
-    print(f"{CYAN}[1/4] Log Ingestion...{RESET}")
+    print(f"{CYAN}[1/4] Log Ingestion (DuckDB/Parquet)...{RESET}")
     reader = LogReader(args.log)
-    df = reader.read_and_resample(target_hz=10, config_path=config_path, generate_dummy=args.dummy)
+    con = reader.read_and_resample(target_hz=10, config_path=config_path, generate_dummy=args.dummy)
 
-    print(f"{CYAN}[2/4] Feature Abstraction...{RESET}")
+    print(f"{CYAN}[2/4] Feature Abstraction (Dynamic SQL)...{RESET}")
     extractor = FeatureExtractor(config_path)
-    features_ts = extractor.compute_features(df)
-    if '__flight_mode__' in df.columns:
-        features_ts['__flight_mode__'] = df['__flight_mode__']
+    extractor.compute_features(con)
 
     print(f"{CYAN}[3/4] Temporal Rule Evaluation & Causal Arbiter...{RESET}")
     engine = RuleEngine(rules_path, sample_hz=10)
-    findings = engine.evaluate(features_ts, events=reader.events)
+    findings = engine.evaluate(con, events=reader.events)
 
     if findings and ArduPilotRAG is not None:
         print(f"{CYAN}[+] Querying RAG Pipeline for dynamic fixes...{RESET}")
@@ -83,7 +75,51 @@ def main():
             logging.warning(f"RAG failed: {e}")
 
     print(f"{CYAN}[4/4] Generating Outputs...{RESET}")
-    plot_path = generate_diagnostic_plot(df, findings, events=reader.events, output_path=args.plot_output)
+    
+    # Optional: fetch back raw data to Pandas for visualize.py
+    # because visualize.py hasn't been adapted to query DuckDB directly yet
+    # We will just pull required tables back for plotting if they exist to keep visualize happy.
+    
+    # Getting a combined dataframe to pass to visualize.py
+    # Or ideally modifying visualize.py to accept DuckDB. For now we will create a mock df
+    # with the signals required to not break visualize.py without further edits.
+    
+    plot_signals = set()
+    for f in findings:
+        plot_signals.update(f.get('plot_signals', []))
+        
+    dfs = []
+    
+    for sig in plot_signals:
+        table_col = sig.split('.')
+        if len(table_col) == 2:
+            tbl, col = table_col
+            try:
+                sig_df = con.execute(f"SELECT TimeUS, {col} as '{sig}' FROM {tbl} WHERE TimeUS IS NOT NULL").df()
+                sig_df['TimeUS'] = pd.to_timedelta(sig_df['TimeUS'], unit='us')
+                sig_df.set_index('TimeUS', inplace=True)
+                dfs.append(sig_df)
+            except Exception:
+                pass
+                
+    try:
+        mode_df = con.execute("SELECT TimeUS, mode as '__flight_mode__' FROM mode_changes").df()
+        mode_df['TimeUS'] = pd.to_timedelta(mode_df['TimeUS'], unit='us')
+        mode_df.set_index('TimeUS', inplace=True)
+        dfs.append(mode_df)
+    except Exception:
+        pass
+        
+    if dfs:
+        df_plot = dfs[0].join(dfs[1:], how='outer').ffill()
+    else:
+        df_plot = pd.DataFrame()
+
+    try:
+        plot_path = generate_diagnostic_plot(df_plot, findings, events=reader.events, output_path=args.plot_output)
+    except Exception as e:
+        logging.warning(f"Plot generation failed: {e}")
+        plot_path = None
 
     serializable_findings = [_serialize_finding(f) for f in findings]
     
@@ -107,7 +143,7 @@ def main():
     with open(args.output, 'w') as f:
         json.dump(report, f, indent=4)
         
-    print(f"{GREEN}Done! Plot saved to {plot_path}, JSON report to {args.output}{RESET}")
+    print(f"{GREEN}Done! JSON report to {args.output}{RESET}")
 
 if __name__ == '__main__':
     main()
