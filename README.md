@@ -4,6 +4,16 @@
 
 A diagnostic tool that analyzes ArduPilot DataFlash `.bin` logs to automatically pinpoint root causes of flight failures. Instead of manually graphing signals in MAVExplorer and eyeballing anomalies, this tool runs a declarative rule engine against the full telemetry timeline and highlights exactly where and why a failure occurred.
 
+## V2 Architecture Update: The DuckDB & Parquet Migration
+
+To handle massive, gigabyte-scale telemetry logs that routinely caused Out-Of-Memory (OOM) crashes in the original Python/Pandas prototype, the pipeline has been completely re-architected. **The declarative YAML contracts remain 100% unchanged**, but the underlying execution engine has been radically transformed:
+
+*   **Out-of-Core SQL Engine:** In-memory Pandas DataFrames and Python `ast` syntax trees have been entirely replaced by an out-of-core **DuckDB** instance, natively enforcing bounded memory (`PRAGMA memory_limit='4GB'`).
+*   **PyArrow Streaming:** Raw `pymavlink` parsing now chunks data (100k rows at a time) directly to columnar Parquet files using strict `pyarrow.schema` structures to prevent type-inference crashes on extremely sparse events like text messages or mode changes.
+*   **Deterministic ASOF Joins:** Replaced lossy `FULL OUTER JOIN` operations with mathematically ranked hardware frequencies. The engine deterministically anchors `ASOF LEFT JOIN` queries on the highest-frequency sensor (e.g., 400Hz IMU over 5Hz GPS), guaranteeing zero data degradation when joining asynchronous arrays.
+*   **SQL-Native Causal Arbiter:** Multi-step causal sequence tracking (e.g., distinguishing a "motor failure" root cause from the resulting "altitude drop" symptom) is now evaluated natively over a `diagnostic_meta_log` table using fast SQL Window Functions rather than O(N) Python loops.
+*   **Concurrency Safe:** To support unbounded parallel processing in `batch_analyze.py`, DuckDB spill directories (`./duckdb_tmp_spill_${PID}`) are now dynamically bound to the exact process ID and aggressively cleaned up via `try...finally: shutil.rmtree` teardowns, eliminating overlapping race conditions.
+
 ## Architecture
 
 ```

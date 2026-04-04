@@ -6,8 +6,8 @@ which message types and fields to extract from feature_registry.yaml.
 
 Domain-aware features:
   - Parses PARM table for vehicle configuration (FRAME_CLASS, FRAME_TYPE)
-  - Extracts MODE messages
-  - Collects MSG (text warnings) and ERR (error codes) with timestamps
+  - Extracts MODE messages directly to Parquet
+  - Collects MSG (text warnings) and ERR (error codes) directly to Parquet
   - Streams output directly into columnar Parquet files sharded by message type
   - Initializes a DuckDB connection and mounts shards as raw tables
 """
@@ -16,9 +16,9 @@ import os
 import re
 import tempfile
 import yaml
+import shutil
 
 import duckdb
-import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -37,12 +37,22 @@ _COPTER_MODES = {
     26: 'AUTOROTATE', 27: 'AUTO_RTL',
 }
 
+_MODE_SCHEMA = pa.schema([
+    ('TimeUS', pa.int64()),
+    ('mode', pa.string()),
+    ('mode_num', pa.int64())
+])
+
+_EVENT_SCHEMA = pa.schema([
+    ('TimeUS', pa.int64()),
+    ('type', pa.string()),
+    ('text', pa.string()),
+    ('subsys', pa.int64()),
+    ('ecode', pa.int64())
+])
+
 
 def parse_required_columns(config_path: str) -> dict[str, set[str]]:
-    """
-    Parse feature_registry.yaml and extract which specific columns are
-    needed from which message types.
-    """
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
 
@@ -60,7 +70,6 @@ def parse_required_columns(config_path: str) -> dict[str, set[str]]:
                 len(needed), sorted(needed.keys()))
     return needed
 
-
 def _add_column(col_ref: str, needed: dict[str, set[str]]):
     m = _MSG_PREFIX.match(col_ref)
     if m:
@@ -68,18 +77,24 @@ def _add_column(col_ref: str, needed: dict[str, set[str]]):
         field = col_ref[len(msg_type) + 1:]
         needed.setdefault(msg_type, set()).add(field)
 
-
 class LogReader:
-    """
-    Reads ArduPilot DataFlash .bin logs into DuckDB via Parquet shards.
-    """
-
     def __init__(self, filepath: str):
         self.filepath = filepath
         self.metadata = {}
+        self.events_count = 0
+        self.mode_changes_count = 0
+        self.temp_dir = tempfile.mkdtemp(prefix="ardupilot_log_")
+        
+        pid = os.getpid()
+        self.duckdb_tmp = f'./duckdb_tmp_spill_{pid}'
+        
+        # Clean up anything from a previous run with THIS exact PID
+        shutil.rmtree(self.duckdb_tmp, ignore_errors=True)
+        os.makedirs(self.duckdb_tmp, exist_ok=True)
+        
+        # Deprecated: kept empty to not break downstream components expecting this attribute
         self.events = []
         self.mode_changes = []
-        self.temp_dir = tempfile.mkdtemp(prefix="ardupilot_log_")
 
     def read_and_resample(self, target_hz: int = 10,
                           config_path: str = None,
@@ -88,8 +103,10 @@ class LogReader:
             raise ValueError("config_path (feature_registry.yaml) is required.")
 
         if generate_dummy:
-            # Dummy generation for DuckDB architecture is mocked out for step 1
-            return duckdb.connect(':memory:')
+            con = duckdb.connect(':memory:')
+            con.execute(f"PRAGMA temp_directory='{self.duckdb_tmp}'")
+            con.execute("PRAGMA memory_limit='4GB'")
+            return con
 
         needed = parse_required_columns(config_path)
         return self._parse_bin(needed, target_hz)
@@ -106,6 +123,10 @@ class LogReader:
 
         msg_types = set(needed.keys())
         streams: dict[str, list[dict]] = {t: [] for t in msg_types}
+        
+        # New independent streams for events and modes
+        streams['mode_changes'] = []
+        streams['log_events'] = []
 
         CHUNK_SIZE = 100_000
         writers = {}
@@ -131,42 +152,60 @@ class LogReader:
             if mtype == 'MODE':
                 try:
                     time_us = msg.TimeUS
-                    mode_num = getattr(msg, 'ModeNum',
-                                       getattr(msg, 'Mode', None))
+                    mode_num = getattr(msg, 'ModeNum', getattr(msg, 'Mode', None))
                     mode_name = getattr(msg, 'Name', None)
                     if mode_name is None and mode_num is not None:
-                        mode_name = _COPTER_MODES.get(
-                            int(mode_num), f'MODE_{mode_num}'
-                        )
-                    self.mode_changes.append({
+                        mode_name = _COPTER_MODES.get(int(mode_num), f'MODE_{mode_num}')
+                    
+                    row = {
                         'TimeUS': time_us,
                         'mode': mode_name or 'UNKNOWN',
-                        'mode_num': mode_num,
-                    })
+                        'mode_num': int(mode_num) if mode_num is not None else None,
+                    }
+                    streams['mode_changes'].append(row)
+                    self.mode_changes_count += 1
+                    
+                    if len(streams['mode_changes']) >= CHUNK_SIZE:
+                        self._flush_stream('mode_changes', streams['mode_changes'], writers)
+                        streams['mode_changes'] = []
                 except AttributeError:
                     pass
                 continue
 
             if mtype == 'MSG':
                 try:
-                    self.events.append({
+                    row = {
                         'TimeUS': msg.TimeUS,
                         'type': 'MSG',
                         'text': msg.Message,
-                    })
+                        'subsys': None,
+                        'ecode': None
+                    }
+                    streams['log_events'].append(row)
+                    self.events_count += 1
+                    
+                    if len(streams['log_events']) >= CHUNK_SIZE:
+                        self._flush_stream('log_events', streams['log_events'], writers)
+                        streams['log_events'] = []
                 except AttributeError:
                     pass
                 continue
 
             if mtype == 'ERR':
                 try:
-                    self.events.append({
+                    row = {
                         'TimeUS': msg.TimeUS,
                         'type': 'ERR',
                         'text': f"Subsys={msg.Subsys} Code={msg.ECode}",
-                        'subsys': msg.Subsys,
-                        'ecode': msg.ECode,
-                    })
+                        'subsys': getattr(msg, 'Subsys', None),
+                        'ecode': getattr(msg, 'ECode', None)
+                    }
+                    streams['log_events'].append(row)
+                    self.events_count += 1
+                    
+                    if len(streams['log_events']) >= CHUNK_SIZE:
+                        self._flush_stream('log_events', streams['log_events'], writers)
+                        streams['log_events'] = []
                 except AttributeError:
                     pass
                 continue
@@ -186,6 +225,7 @@ class LogReader:
                 self._flush_stream(mtype, streams[mtype], writers)
                 streams[mtype] = []
 
+        # Flush any remaining rows
         for mtype, rows in streams.items():
             if rows:
                 self._flush_stream(mtype, rows, writers)
@@ -195,34 +235,41 @@ class LogReader:
 
         logger.info(
             "Metadata: %s. Mode changes: %d. Events: %d.",
-            self.metadata, len(self.mode_changes), len(self.events),
+            self.metadata, self.mode_changes_count, self.events_count,
         )
         return self._init_duckdb()
 
     def _flush_stream(self, mtype: str, rows: list[dict], writers: dict):
         if not rows:
             return
-        df = pd.DataFrame(rows)
-        table = pa.Table.from_pandas(df)
+            
+        schema = None
+        if mtype == 'mode_changes':
+            schema = _MODE_SCHEMA
+        elif mtype == 'log_events':
+            schema = _EVENT_SCHEMA
+
+        # PyArrow table builder matching the required schema
+        table = pa.Table.from_pylist(rows, schema=schema)
+        
         if mtype not in writers:
             path = os.path.join(self.temp_dir, f"{mtype}.parquet")
             writers[mtype] = pq.ParquetWriter(path, table.schema)
+            
         writers[mtype].write_table(table)
 
     def _init_duckdb(self) -> duckdb.DuckDBPyConnection:
+        # Step 1 Fix: Guard memory limit and provide spill path
         con = duckdb.connect(':memory:')
+        con.execute(f"PRAGMA temp_directory='{self.duckdb_tmp}'")
+        con.execute("PRAGMA memory_limit='4GB'")
+        
         for filename in os.listdir(self.temp_dir):
             if filename.endswith(".parquet"):
                 mtype = filename[:-8]
                 path = os.path.join(self.temp_dir, filename)
+                # Mount directly as a DuckDB view
                 con.execute(f"CREATE VIEW {mtype} AS SELECT * FROM read_parquet('{path}')")
                 logger.info("Mounted %s from %s", mtype, path)
         
-        if self.mode_changes:
-            df_modes = pd.DataFrame(self.mode_changes)
-            con.execute("CREATE TABLE mode_changes AS SELECT * FROM df_modes")
-        if self.events:
-            df_events = pd.DataFrame(self.events)
-            con.execute("CREATE TABLE log_events AS SELECT * FROM df_events")
-            
         return con
