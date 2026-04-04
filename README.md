@@ -4,41 +4,69 @@
 
 A diagnostic tool that analyzes ArduPilot DataFlash `.bin` logs to automatically pinpoint root causes of flight failures. Instead of manually graphing signals in MAVExplorer and eyeballing anomalies, this tool runs a declarative rule engine against the full telemetry timeline and highlights exactly where and why a failure occurred.
 
-## V2 Architecture Update: The DuckDB & Parquet Migration
+## V1 Baseline Architecture (Original Iteration)
 
-To handle massive, gigabyte-scale telemetry logs that routinely caused Out-Of-Memory (OOM) crashes in the original Python/Pandas prototype, the pipeline has been completely re-architected. **The declarative YAML contracts remain 100% unchanged**, but the underlying execution engine has been radically transformed:
-
-*   **Out-of-Core SQL Engine:** In-memory Pandas DataFrames and Python `ast` syntax trees have been entirely replaced by an out-of-core **DuckDB** instance, natively enforcing bounded memory (`PRAGMA memory_limit='4GB'`).
-*   **PyArrow Streaming:** Raw `pymavlink` parsing now chunks data (100k rows at a time) directly to columnar Parquet files using strict `pyarrow.schema` structures to prevent type-inference crashes on extremely sparse events like text messages or mode changes.
-*   **Deterministic ASOF Joins:** Replaced lossy `FULL OUTER JOIN` operations with mathematically ranked hardware frequencies. The engine deterministically anchors `ASOF LEFT JOIN` queries on the highest-frequency sensor (e.g., 400Hz IMU over 5Hz GPS), guaranteeing zero data degradation when joining asynchronous arrays.
-*   **SQL-Native Causal Arbiter:** Multi-step causal sequence tracking (e.g., distinguishing a "motor failure" root cause from the resulting "altitude drop" symptom) is now evaluated natively over a `diagnostic_meta_log` table using fast SQL Window Functions rather than O(N) Python loops.
-*   **Concurrency Safe:** To support unbounded parallel processing in `batch_analyze.py`, DuckDB spill directories (`./duckdb_tmp_spill_${PID}`) are now dynamically bound to the exact process ID and aggressively cleaned up via `try...finally: shutil.rmtree` teardowns, eliminating overlapping race conditions.
-
-## Architecture
+The first iteration established the core diagnostic idea as a deterministic expert system. The design goal was interpretability: every diagnosis should map to explicit telemetry thresholds in YAML, not opaque model behavior.
 
 ```
 ┌─────────────┐    ┌──────────────────┐    ┌──────────────────┐    ┌──────────────────┐
 │  .bin Log    │───▶│  Ingestion       │───▶│  Feature         │───▶│  Rule Engine      │
 │  (DataFlash) │    │  (DFReader,      │    │  Abstraction     │    │  (YAML rules,     │
-│              │    │   memory-        │    │  (AST parser,    │    │   temporal eval,   │
-│              │    │   efficient)     │    │   YAML fallbacks)│    │   hysteresis)      │
+│              │    │   selective      │    │  (AST parser,    │    │   temporal eval,   │
+│              │    │   extraction)    │    │   fallbacks)     │    │   hysteresis)      │
 └─────────────┘    └──────────────────┘    └──────────────────┘    └────────┬───────────┘
-                                                                           │
-                                                                           ▼
-                                                                   ┌──────────────────┐
-                                                                   │ Diagnostic Plot   │
-                                                                   │ + JSON Report     │
-                                                                   │ (exact fault      │
-                                                                   │  window shading)  │
-                                                                   └──────────────────┘
+                     │
+                     ▼
+                   ┌──────────────────┐
+                   │ Diagnostic Plot   │
+                   │ + JSON Report     │
+                   │ (fault window +   │
+                   │  causal summary)  │
+                   └──────────────────┘
 ```
 
-### Key Design Decisions
+### V1 Design Characteristics
 
-- **Version-agnostic features**: A YAML registry with fallback expressions handles firmware field renames without code changes.
-- **Temporal evaluation**: Rules evaluate the full time-series — AND conditions must be simultaneously true for a configurable `duration_seconds` to prevent false positives from noise spikes.
-- **Memory-efficient parsing**: Only the specific MSG.Field combinations referenced in the YAML are extracted from the `.bin` file.
-- **Safe expression parsing**: Uses Python's `ast` module instead of `eval()` for computing fallback expressions.
+- **Telemetry contract:** `feature_registry.yaml` defined `priority_1` and fallback expressions so diagnostic features survived firmware field-name drift.
+- **Compute model:** feature fallback math was parsed through a safe AST pipeline to keep expressions auditable and avoid dynamic eval risk.
+- **Temporal logic model:** `rules.yaml` encoded deterministic fault conditions with sustained truth windows to suppress noise spikes.
+- **Data access pattern:** selective extraction pulled only referenced `MSG.Field` pairs to reduce unnecessary parsing work.
+- **Output semantics:** JSON reports and diagnostic plots were explainable, rule-linked, and easy for reviewers to trace.
+
+This baseline was excellent for explainability and rapid iteration, but high-volume logs revealed memory pressure and asynchronous join fragility.
+
+## V2 Architecture Update (DuckDB + Parquet)
+
+To scale from proof-of-concept to production-size logs, the execution engine was redesigned while preserving the same YAML contracts and diagnostic semantics.
+
+```
+┌─────────────┐    ┌───────────────────┐    ┌───────────────────┐    ┌──────────────────┐
+│  .bin Log    │───▶│  Ingestion       │───▶│  Feature Views     │───▶│  Rule Engine      │
+│  (DataFlash) │    │  (PyArrow +      │    │  (ASOF joins +     │    │  (SQL windows +   │
+│              │    │   Parquet shards)│    │   SQL COALESCE)    │    │   causal arbiter) │
+└─────────────┘    └────────┬──────────┘    └───────────────────┘    └────────┬─────────┘
+          │                                                 │
+          ▼                                                 ▼
+       ┌───────────────────┐                              ┌──────────────────┐
+       │  DuckDB Engine    │                              │ Diagnostic Plot   │
+       │  (out-of-core,    │                              │ + JSON Report     │
+       │   memory-bounded) │                              │ (same semantics)  │
+       └───────────────────┘                              └──────────────────┘
+```
+
+### V2 Design Characteristics
+
+- **Telemetry contract:** same YAML interfaces and rule semantics were preserved, so community rule authoring workflows did not change.
+- **Compute model:** execution moved to DuckDB SQL with bounded memory control (`PRAGMA memory_limit='4GB'`) for out-of-core reliability.
+- **Temporal logic model:** rule windows and causality now execute natively in SQL, including sequence tracking via `diagnostic_meta_log`.
+- **Data access pattern:** ingestion streams 100k-row Parquet shards with explicit PyArrow schemas to prevent sparse type inference failures.
+- **Output semantics:** reports and plots remain equivalent in meaning, but are now produced through a scale-safe execution engine.
+
+### Transition: From Idea to Scale
+
+- **What stayed stable:** rule intent, YAML contracts, feature naming, report structure, and interpretability.
+- **What shifted:** in-memory processing to out-of-core SQL, ad-hoc joins to deterministic `ASOF LEFT JOIN`, and shared temp paths to PID-isolated spill directories.
+- **Why this matters:** readers can understand the continuity of diagnostic reasoning and the engineering shift required to support large real-world logs and parallel batch runs.
 
 ## Quick Start
 
