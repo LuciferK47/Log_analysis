@@ -178,3 +178,28 @@ rules:
     plot_signals:
       - "BATT.Curr"
       - "BATT.Volt"
+
+  motor_1_failure:
+    id: "motor_1_failure"
+    name: "Motor 1 Failure"
+    category: "Hardware/Motor"
+    description: "Spike in RCOU Max 2s linked with Roll Var 2s"
+    severity: "CRITICAL"
+    streams:
+      required: ["rcou_c1_max_2s", "roll_var_2s"]
+      optional: []
+    conditions:
+      - feature: "rcou_c1_max_2s"
+        operator: ">="
+        threshold: 3000
+      - feature: "roll_var_2s"
+        operator: ">"
+        threshold: 0.10
+    logic: "AND"
+    windows:
+      macro_window_sec: null
+      micro_window_sec: null
+    causality:
+      is_root_cause_candidate: true
+      symptoms: []
+    plot_signals: []

@@ -25,83 +25,81 @@ The first iteration established the core diagnostic idea as a deterministic expe
                    └──────────────────┘
 ```
 
-### V1 Design Characteristics
+## V2 Architecture: Polars Lazy Execution & ML Hybrid Fallback
 
-- **Telemetry contract:** `feature_registry.yaml` defined `priority_1` and fallback expressions so diagnostic features survived firmware field-name drift.
-- **Compute model:** feature fallback math was parsed through a safe AST pipeline to keep expressions auditable and avoid dynamic eval risk.
-- **Temporal logic model:** `rules.yaml` encoded deterministic fault conditions with sustained truth windows to suppress noise spikes.
-- **Data access pattern:** selective extraction pulled only referenced `MSG.Field` pairs to reduce unnecessary parsing work.
-- **Output semantics:** JSON reports and diagnostic plots were explainable, rule-linked, and easy for reviewers to trace.
-
-This baseline was excellent for explainability and rapid iteration, but high-volume logs revealed memory pressure and asynchronous join fragility.
-
-## V2 Architecture Update (DuckDB + Parquet)
-
-To scale from proof-of-concept to production-size logs, the execution engine was redesigned while preserving the same YAML contracts and diagnostic semantics.
+To scale from proof-of-concept to production, the execution engine was completely overhauled. We transitioned to a high-speed Rust-based dataframe backend (Polars) and integrated a Machine Learning fallback to catch complex, non-deterministic anomalies.
 
 ```
-┌─────────────┐    ┌───────────────────┐    ┌───────────────────┐    ┌──────────────────┐
-│  .bin Log    │───▶│  Ingestion       │───▶│  Feature Views     │───▶│  Rule Engine      │
-│  (DataFlash) │    │  (PyArrow +      │    │  (ASOF joins +     │    │  (SQL windows +   │
-│              │    │   Parquet shards)│    │   SQL COALESCE)    │    │   causal arbiter) │
-└─────────────┘    └────────┬──────────┘    └───────────────────┘    └────────┬─────────┘
-          │                                                 │
-          ▼                                                 ▼
-       ┌───────────────────┐                              ┌──────────────────┐
-       │  DuckDB Engine    │                              │ Diagnostic Plot   │
-       │  (out-of-core,    │                              │ + JSON Report     │
-       │   memory-bounded) │                              │ (same semantics)  │
-       └───────────────────┘                              └──────────────────┘
+┌─────────────┐    ┌───────────────────┐    ┌───────────────────┐     ┌──────────────────┐
+│  .bin Log    │───▶│  Parquet Ingestion│───▶│  Polars Rule      │───▶ │  (If Ambiguous)  │
+│  (DataFlash) │    │  (PyArrow out-of- │    │  Engine (Lazy     │  │  │  XGBoost ML      │
+│              │    │   core chunking)  │    │  execution)       │  │  │  Classifier      │
+└─────────────┘    └───────────────────┘    └────────┬──────────┘  │  └────────┬─────────┘
+                                                     │             │           │
+                                                     ▼             ▼           ▼
+                                                  ┌────────────────────────────────┐
+                                                  │         ChromaDB RAG           │
+                                                  │       Vector DB Context        │
+                                                  └───────────────┬────────────────┘
+                                                                  │
+                                                                  ▼
+                                                  ┌────────────────────────────────┐
+                                                  │      FastAPI / CLI Output      │
+                                                  │      (JSON Diagnostic Payload) │
+                                                  └────────────────────────────────┘
 ```
 
-### V2 Design Characteristics
+### Key Engineering Achievements
 
-- **Telemetry contract:** same YAML interfaces and rule semantics were preserved, so community rule authoring workflows did not change.
-- **Compute model:** execution moved to DuckDB SQL with bounded memory control (`PRAGMA memory_limit='4GB'`) for out-of-core reliability.
-- **Temporal logic model:** rule windows and causality now execute natively in SQL, including sequence tracking via `diagnostic_meta_log`.
-- **Data access pattern:** ingestion streams 100k-row Parquet shards with explicit PyArrow schemas to prevent sparse type inference failures.
-- **Output semantics:** reports and plots remain equivalent in meaning, but are now produced through a scale-safe execution engine.
-
-### Transition: From Idea to Scale
-
-- **What stayed stable:** rule intent, YAML contracts, feature naming, report structure, and interpretability.
-- **What shifted:** in-memory processing to out-of-core SQL, ad-hoc joins to deterministic `ASOF LEFT JOIN`, and shared temp paths to PID-isolated spill directories.
-- **Why this matters:** readers can understand the continuity of diagnostic reasoning and the engineering shift required to support large real-world logs and parallel batch runs.
+*   **Out-of-Core Processing**: Using PyArrow, we chunk large `.bin` logs directly into partitioned Parquet files. This keeps RAM usage strictly bounded, preventing OOM crashes on massive multi-hour flight logs.
+*   **Polars Lazy Evaluation**: The engine leverages `pl.scan_parquet()` and `join_asof()` to temporally align asynchronous sensors natively in Rust/Arrow before ever triggering computation. This results in incredibly fast query resolution (~50ms execution times).
+*   **XGBoost Fallback (Early Detection)**: If the deterministic rules fail to catch a failure or present ambiguous data, a cost-sensitively trained XGBoost model evaluates the rolling windows to catch creeping faults (e.g., detecting motor failure via feature correlation up to 4 seconds early). It was trained using Group-Shuffle-Split to explicitly prevent time-series target leakage across sequential flight windows.
+*   **ChromaDB Vector RAG**: When an anomaly is detected (deterministically or via ML), a local semantic search is triggered in a persistent ChromaDB instance. This retrieves the exact ArduPilot Wiki documentation and integrates it directly into the JSON troubleshooting payload.
 
 ## Quick Start
+
+### CLI Interface
 
 ```bash
 cd prototype
 pip install -r requirements.txt
+cd ..
 
-# Analyze a real SITL crash log
-python3 cli.py --log /path/to/flight.BIN --plot -v
-
-# Analyze with custom rules
-python3 cli.py --log flight.BIN --rules my_rules.yaml --plot --output report.json
+# Analyze a physical flight log automatically
+python3 cli.py analyze --log /path/to/flight.BIN
 ```
 
-For a complete guide on generating crash logs with SITL, see [docs/SITL_TUTORIAL.md](docs/SITL_TUTORIAL.md).
+### FastAPI Backend
 
-### Smoke Test with Dummy Data
+This architecture is fully web-compatible for ArduPilot WebTools integration. 
 
-For quick verification that the pipeline works, simulated scenarios are available:
-
+**Start the Server:**
 ```bash
-python3 cli.py --dummy motor_loss --plot -v
-python3 cli.py --dummy gps_glitch --plot -v
-python3 cli.py --dummy vibration --plot -v
+uvicorn api:app --reload
 ```
 
-### Batch Analysis
-
-To process multiple `.bin` logs concurrently and generate reports/plots for all of them:
-
+**Analyze a Log via REST:**
 ```bash
-python3 batch_analyze.py
+curl -X POST -F "file=@Logs/Faulty/2022-06-27 13-14-19.bin" http://127.0.0.1:8000/analyze
 ```
-This will automatically scan the `Logs/` directory and output all JSON reports and PNG plots into the `analysis_results/` folder.
 
+## Project Structure
+
+```
+prototype/
+├── api.py                  # FastAPI REST backend for WebTools integration
+├── cli.py                  # CLI Orchestrator entry point
+├── ingest_chunked.py       # Memory-safe out-of-core PyArrow ingestion
+├── rule_engine_polars.py   # Polars lazy evaluation & Hybrid orchestrator
+├── train_xgboost.py        # Group-Shuffle-Split ML training pipeline
+├── xgboost_fallback.json   # Pre-trained XGBoost classification model
+├── rag_pipeline.py         # Retrieval-Augmented Generation (ChromaDB)
+├── ingest_kb.py            # Local Vector Database constructor for Wiki text
+├── rules.yaml              # Declarative diagnostic rules (community-extensible)
+└── requirements.txt        # Python dependencies
+ardupilot_knowledge_base/   # Compiled local ChromaDB instance
+Logs/                       # Real flight datasets (Healthy / Faulty splits)
+```
 
 ## How It Compares to MAVExplorer
 
@@ -110,64 +108,10 @@ MAVExplorer is ArduPilot's standard log viewer — it's a manual graphing tool w
 | | MAVExplorer | This Tool |
 |---|---|---|
 | **Input** | Pilot manually selects signals | Automatically reads all relevant signals |
-| **Analysis** | Human eyeballs anomalies | YAML rules evaluate the full timeline |
-| **Output** | Interactive plots | Diagnostic report + plot with exact fault window |
+| **Analysis** | Human eyeballs anomalies | YAML rules evaluate the full timeline (with ML fallback) |
+| **Output** | Interactive plots | Diagnostic JSON payload mapped to RAG Context |
 | **Speed** | Minutes per log | Seconds per log |
 | **Extensibility** | N/A | Community adds rules via YAML |
-
-The [SITL tutorial](docs/SITL_TUTORIAL.md) includes instructions for generating a side-by-side comparison between this tool and MAVExplorer on the same crash log.
-
-## Detected Failure Classes
-
-| Failure | Key Signals | Hysteresis | SITL Command |
-|---------|------------|------------|--------------|
-| Motor/ESC Loss | ATT.Roll, RCOU.C1-C4 | 1.5s | `SIM_ENGINE_FAIL=1` |
-| GPS Glitch | GPS.HDop, NKF4.SP | 2.0s | `SIM_GPS_GLITCH_X=0.001` |
-| Excessive Vibration | VIBE.VibeX/Y/Z, Clip0 | 1.0s | `SIM_VIB_MOT_MAX=30` |
-| Battery Sag | BATT.Volt | 3.0s | `SIM_BATT_VOLTAGE=13.5` |
-| EKF Divergence | NKF4.SP, GPS.HDop | 2.0s | Complex multi-sensor |
-
-## Adding Custom Rules
-
-Rules live in `rules.yaml`. Adding a new heuristic requires zero Python changes:
-
-```yaml
-my_custom_rule:
-  conditions:
-    - feature: "some_feature"
-      operator: ">"
-      threshold: 42
-  logic: "AND"
-  duration_seconds: 2.0    # Must stay true for 2s straight
-  severity: "WARNING"
-  confidence: 0.75
-  suggested_fix: "Check XYZ."
-  plot_signals:
-    - "SOME.Signal"
-```
-
-## Project Structure
-
-```
-prototype/
-├── cli.py                  # CLI entry point
-├── ingestion.py            # Memory-efficient .bin reader (pymavlink DFReader)
-├── abstraction.py          # YAML-driven feature extraction (AST-based math)
-├── rule_engine.py          # Temporal rule evaluation with per-rule hysteresis
-├── visualize.py            # Diagnostic plots with exact fault-window shading
-├── rag_pipeline.py         # Retrieval-Augmented Generation (ChromaDB) for context
-├── ingest_kb.py            # Knowledge base ingestion for RAG
-├── feature_registry.yaml   # Feature definitions with version fallbacks
-├── rules.yaml              # Diagnostic rules (community-extensible)
-├── setup_sitl.sh           # SITL environment setup script
-└── requirements.txt        # Python dependencies
-docs/
-├── SITL_TUTORIAL.md        # Step-by-step guide for test data
-└── images/                 # Authentic diagnostic plots
-batch_analyze.py            # Pipeline script for bulk log processing
-debug.py                    # Sandbox script for testing telemetry
-Proposal_2.tex              # Comprehensive GSoC 2026 LaTeX Proposal
-```
 
 ## License
 

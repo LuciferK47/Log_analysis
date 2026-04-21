@@ -1,0 +1,2 @@
+Primary Power Collapse is often caused by a bad battery or overdrawing current. Check BATT.Volt logs.
+EKF Primary Core Divergence happens when GPS or compass data is heavily corrupted or excessive vibration is present.

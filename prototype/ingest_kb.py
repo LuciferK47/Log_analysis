@@ -1,69 +1,40 @@
 """
-ingest_kb.py - Offline Script to vectorize the ArduPilot knowledge base
+ingest_kb.py - Script to vectorize the ArduPilot knowledge base
 into ChromaDB for the RAG pipeline.
 """
 import os
-
-try:
-    import chromadb
-    from chromadb.utils import embedding_functions
-except ImportError:
-    print("Please install chromadb: pip install chromadb")
-    exit(1)
-
-def chunk_text(text, chunk_size=300, overlap=50):
-    words = text.split()
-    chunks = []
-    for i in range(0, len(words), chunk_size - overlap):
-        chunks.append(" ".join(words[i:i+chunk_size]))
-    return chunks
+import chromadb
 
 def main():
-    kb_dir = "./knowledge_base"
     db_path = "./ardupilot_knowledge_base"
+    os.makedirs(db_path, exist_ok=True)
 
-    os.makedirs(kb_dir, exist_ok=True)
-    
-    if not os.listdir(kb_dir):
-        with open(os.path.join(kb_dir, "sample.txt"), "w") as f:
-            f.write("Primary Power Collapse is often caused by a bad battery or overdrawing current. Check BATT.Volt logs.\n")
-            f.write("EKF Primary Core Divergence happens when GPS or compass data is heavily corrupted or excessive vibration is present.\n")
-
+    print("Initializing ChromaDB PersistentClient...")
     client = chromadb.PersistentClient(path=db_path)
-    ef = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
-    collection = client.get_or_create_collection(
-        name="ardupilot_wiki",
-        embedding_function=ef
+    
+    # We use the default embedding function to avoid heavy PyTorch dependencies.
+    print("Getting or creating collection 'ardupilot_docs'...")
+    collection = client.get_or_create_collection(name="ardupilot_docs")
+
+    docs = [
+        "When an ESC fails or a motor desyncs, ArduPilot will push the corresponding RCOU channel to its maximum limit (e.g., 1900+ PWM) to compensate, but physical orientation (ATT.Roll/Pitch) will continue to diverge. Check ESC wiring and motor bells.",
+        "A sudden drop in BATT.Volt accompanied by an immediate loss of altitude indicates a power brownout. Check the primary power rail.",
+        "If GPS.HDop spikes while GPS.NSats drops, the EKF will begin to reject the position data. Check for RF interference."
+    ]
+    ids = ["doc_1", "doc_2", "doc_3"]
+    metadatas = [
+        {"source": "Motor/ESC Failure"},
+        {"source": "Power Collapse"},
+        {"source": "GPS Glitch"}
+    ]
+
+    print(f"Ingesting {len(docs)} documents...")
+    collection.add(
+        documents=docs,
+        ids=ids,
+        metadatas=metadatas
     )
-
-    docs, ids, metadatas = [], [], []
-    doc_id = 0
-
-    for filename in os.listdir(kb_dir):
-        if not filename.endswith(".txt"): 
-            continue
-            
-        filepath = os.path.join(kb_dir, filename)
-        with open(filepath, "r", encoding="utf-8") as f:
-            text = f.read()
-
-        for chunk in chunk_text(text):
-            if not chunk.strip(): continue
-            docs.append(chunk)
-            ids.append(f"doc_{doc_id}")
-            metadatas.append({"source": filename})
-            doc_id += 1
-
-    if docs:
-        print(f"Ingesting {len(docs)} chunks...")
-        collection.add(
-            documents=docs,
-            ids=ids,
-            metadatas=metadatas
-        )
-        print(f"Successfully ingested {len(docs)} chunks from {kb_dir} into ChromaDB at {db_path}.")
-    else:
-        print("No documents found to ingest.")
+    print(f"Successfully ingested {len(docs)} documents into ChromaDB at {db_path}.")
 
 if __name__ == "__main__":
     main()
