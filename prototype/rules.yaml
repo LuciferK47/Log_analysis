@@ -203,3 +203,25 @@ rules:
       is_root_cause_candidate: true
       symptoms: []
     plot_signals: []
+
+  kinematic_divergence:
+    id: "kinematic_divergence"
+    name: "Kinematic Divergence"
+    category: "Aerodynamics"
+    description: "Aerodynamic control lost. Drone roll diverged from setpoint."
+    severity: "CRITICAL"
+    streams:
+      required: ["roll_error_mean_2s"]
+      optional: []
+    conditions:
+      - feature: "roll_error_mean_2s"
+        operator: ">="
+        threshold: 15.0
+    logic: "AND"
+    windows:
+      macro_window_sec: null
+      micro_window_sec: null
+    causality:
+      is_root_cause_candidate: true
+      symptoms: []
+    plot_signals: []

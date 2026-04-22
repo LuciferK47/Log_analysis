@@ -35,7 +35,7 @@ def build_condition_expr(cond):
     val = cond["threshold"]
     return op_func(col_expr, val)
 
-def generate_diagnostic_report(rule_name, onset_row, confidence=1.0, description="Rule triggered via deterministic causal arbiter.", rag_context=None):
+def generate_diagnostic_report(rule_name, onset_row, confidence=1.0, description="Rule triggered via deterministic causal arbiter.", rag_context=None, hit_count=None, onset_timeus=None, resolution_timeus=None, duration_seconds=None):
     clean_rule_name = rule_name.replace("rule_", "") if rule_name.startswith("rule_") else rule_name
     
     report = {
@@ -49,6 +49,14 @@ def generate_diagnostic_report(rule_name, onset_row, confidence=1.0, description
         },
         "timestamp_window": [onset_row.get('TimeUS'), None] 
     }
+    
+    if hit_count is not None:
+        report["meta_log"] = {
+            "hit_count": hit_count,
+            "onset_timeus": onset_timeus,
+            "resolution_timeus": resolution_timeus,
+            "duration_seconds": duration_seconds
+        }
     
     if rag_context:
         report["rag_context"] = rag_context
@@ -68,7 +76,7 @@ def evaluate_pipeline(att_path, rcou_path, rules_path):
     print("Setting up lazy computation graph...")
 
     # 1. Lazy Evaluation ONLY via pl.scan_parquet()
-    att_lf = pl.scan_parquet(att_path).select(["TimeUS", "Roll"])
+    att_lf = pl.scan_parquet(att_path).select(["TimeUS", "Roll", "DesRoll"])
     rcou_lf = pl.scan_parquet(rcou_path).select(["TimeUS", "C1"])
 
     # 2. Time Conversion
@@ -83,10 +91,15 @@ def evaluate_pipeline(att_path, rcou_path, rules_path):
     # 3. Sensor Fusion (Time Alignment)
     joined_lf = att_lf.join_asof(rcou_lf, on="timestamp", strategy="backward")
 
+    joined_lf = joined_lf.with_columns(
+        (pl.col("Roll") - pl.col("DesRoll")).abs().alias("roll_error")
+    )
+
     # 4. Adaptive Temporal Windowing
     micro_window_lf = joined_lf.rolling(index_column="timestamp", period="2s").agg([
         pl.col("Roll").var().alias("roll_var_2s"),
-        pl.col("C1").max().alias("rcou_c1_max_2s")
+        pl.col("C1").max().alias("rcou_c1_max_2s"),
+        pl.col("roll_error").mean().alias("roll_error_mean_2s")
     ])
 
     macro_window_lf = joined_lf.rolling(index_column="timestamp", period="30s").agg([
@@ -113,8 +126,8 @@ def evaluate_pipeline(att_path, rcou_path, rules_path):
             
         # We only map rules whose required features apply to the columns we actually have
         required_features = [c["feature"] for c in conditions]
-        available_cols = {"TimeUS", "Roll", "timestamp", "C1", 
-                          "roll_var_2s", "rcou_c1_max_2s", 
+        available_cols = {"TimeUS", "Roll", "DesRoll", "timestamp", "C1", "roll_error",
+                          "roll_var_2s", "rcou_c1_max_2s", "roll_error_mean_2s",
                           "roll_mean_30s", "rcou_c1_mean_30s"}
                           
         if not all(rf in available_cols for rf in required_features):
@@ -169,12 +182,19 @@ def evaluate_pipeline(att_path, rcou_path, rules_path):
                 print(f"Targeting root cause signature: {target_rule}")
                 print(f"Triggered Anomaly States Detected: {len(failed_rows)}")
                 
+                # Meta-Logging Calculations
+                hit_count = len(failed_rows)
+                onset_timeus = failed_rows.row(0, named=True).get('TimeUS')
+                resolution_timeus = failed_rows.row(-1, named=True).get('TimeUS')
+                duration_seconds = (resolution_timeus - onset_timeus) / 1_000_000.0 if onset_timeus and resolution_timeus else 0.0
+
                 # Print the VERY FIRST timestamp of failure onset
                 first_fail = failed_rows.row(0, named=True)
                 print("\n>> FAILURE ONSET REVEALED <<")
                 print(f"Timestamp    : {first_fail['timestamp']}")
                 print(f"Onset Roll   : {first_fail['Roll']:.5f}")
                 print(f"Onset RCOU C1: {first_fail['C1']}")
+                print(f"Duration (s) : {duration_seconds:.2f}")
                 print("=============================")
                 
                 rag_context = None
@@ -185,7 +205,15 @@ def evaluate_pipeline(att_path, rcou_path, rules_path):
                     }
                     rag_context = rag_pipeline.retrieve_context(diagnosis_event)
                 
-                report = generate_diagnostic_report(target_rule, first_fail, confidence=1.0, description="Rule triggered via deterministic causal arbiter.", rag_context=rag_context)
+                report = generate_diagnostic_report(
+                    target_rule, first_fail, confidence=1.0, 
+                    description="Rule triggered via deterministic causal arbiter.", 
+                    rag_context=rag_context,
+                    hit_count=hit_count,
+                    onset_timeus=onset_timeus,
+                    resolution_timeus=resolution_timeus,
+                    duration_seconds=duration_seconds
+                )
                 anomaly_triggered = True
                 return report
 
@@ -223,7 +251,11 @@ def evaluate_pipeline(att_path, rcou_path, rules_path):
                     onset_row=first_fail, 
                     confidence=0.85, 
                     description="Anomaly detected via ML feature correlation (Deterministic rules bypassed).",
-                    rag_context=rag_context
+                    rag_context=rag_context,
+                    hit_count=len(anomaly_indices),
+                    onset_timeus=first_fail.get('TimeUS'),
+                    resolution_timeus=result_df.row(anomaly_indices[-1], named=True).get('TimeUS'),
+                    duration_seconds=(result_df.row(anomaly_indices[-1], named=True).get('TimeUS') - first_fail.get('TimeUS')) / 1_000_000.0 if first_fail.get('TimeUS') else 0.0
                 )
             else:
                 print("Status: Stable. No anomalies detected.")
