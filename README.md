@@ -55,6 +55,8 @@ To scale from proof-of-concept to production, the execution engine was completel
 *   **Polars Lazy Evaluation**: The engine leverages `pl.scan_parquet()` and `join_asof()` to temporally align asynchronous sensors natively in Rust/Arrow before ever triggering computation. This results in incredibly fast query resolution (~50ms execution times).
 *   **XGBoost Fallback (Early Detection)**: If the deterministic rules fail to catch a failure or present ambiguous data, a cost-sensitively trained XGBoost model evaluates the rolling windows to catch creeping faults (e.g., detecting motor failure via feature correlation up to 4 seconds early). It was trained using Group-Shuffle-Split to explicitly prevent time-series target leakage across sequential flight windows.
 *   **ChromaDB Vector RAG**: When an anomaly is detected (deterministically or via ML), a local semantic search is triggered in a persistent ChromaDB instance. This retrieves the exact ArduPilot Wiki documentation and integrates it directly into the JSON troubleshooting payload.
+*   **Kinematic Divergence Tracking**: The engine natively tracks aerodynamic control loss by calculating the absolute error between pilot setpoint (ATT.DesRoll) and actual physical response (ATT.Roll) entirely within the Rust/Arrow memory space.
+*   **Meta-Log Duration Analysis**: The Causal Arbiter now tracks the complete temporal footprint of an anomaly. Instead of just flagging the onset, it calculates the hit_count and total duration_seconds of the failure state.
 
 ## Quick Start
 
@@ -81,6 +83,32 @@ uvicorn api:app --reload
 **Analyze a Log via REST:**
 ```bash
 curl -X POST -F "file=@Logs/Faulty/2022-06-27 13-14-19.bin" http://127.0.0.1:8000/analyze
+```
+
+### Sample API Response
+
+```json
+{
+  "status": "failure",
+  "confidence": 0.85,
+  "rule_triggered": "xgboost_ml_fallback",
+  "description": "Anomaly detected via ML feature correlation (Deterministic rules bypassed).",
+  "evidence": {
+    "RCOU.C1": 1886,
+    "ATT.Roll": 1.79
+  },
+  "timestamp_window": [
+    34453552,
+    null
+  ],
+  "meta_log": {
+    "hit_count": 1356,
+    "onset_timeus": 34453552,
+    "resolution_timeus": 482337764,
+    "duration_seconds": 447.88
+  },
+  "rag_context": "When an ESC fails or a motor desyncs, ArduPilot will push the corresponding RCOU channel to its maximum limit (e.g., 1900+ PWM) to compensate..."
+}
 ```
 
 ## Project Structure
